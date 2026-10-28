@@ -18,7 +18,10 @@ fn default_filters_compile() {
 #[test]
 fn every_quic_policy_produces_filters_windivert_accepts() {
     for policy in [QuicPolicy::Off, QuicPolicy::Blocked, QuicPolicy::All] {
-        let cfg = EvasionConfig { quic: policy, ..Default::default() };
+        let cfg = EvasionConfig {
+            quic: policy,
+            ..Default::default()
+        };
         let f = filter::build(&cfg).expect("build");
         compile_filter(&f.main, Layer::Network)
             .unwrap_or_else(|e| panic!("main filter for {policy:?} rejected: {e:?}"));
@@ -41,17 +44,22 @@ fn the_selective_quic_clause_is_present_and_version_agnostic() {
         !s.contains("udp.Payload32[1b]"),
         "pinning the version would miss QUIC v2 and the drafts"
     );
-    assert!(f.quic_drop.is_none(), "selective mode must not also blanket-drop");
+    assert!(
+        f.quic_drop.is_none(),
+        "selective mode must not also blanket-drop"
+    );
 }
 
 #[test]
-fn dns_enabled_filter_compiles() {
+fn dns_redirection_is_rejected_instead_of_silently_capturing_port_53() {
     let cfg = EvasionConfig {
         dns_upstream: Some(IpAddr::V4(Ipv4Addr::new(9, 9, 9, 9))),
         ..Default::default()
     };
-    let f = filter::build(&cfg).expect("build");
-    compile_filter(&f.main, Layer::Network).expect("dns-enabled main filter accepted");
+    let err = filter::build(&cfg).expect_err("unimplemented DNS redirection must fail");
+    let text = err.to_string();
+    assert!(text.contains("dns_upstream"), "{text}");
+    assert!(text.contains("not implemented"), "{text}");
 }
 
 #[test]
@@ -69,8 +77,14 @@ fn default_filter_carries_the_cloudflare_https_alt_ports_and_compiles() {
     let f = filter::build(&EvasionConfig::default()).expect("build");
     let s = f.main.to_str().unwrap();
     for p in ["443", "2053", "2083", "2087", "2096", "8443"] {
-        assert!(s.contains(&format!("tcp.DstPort == {p}")), "outbound missing {p}");
-        assert!(s.contains(&format!("tcp.SrcPort == {p}")), "inbound missing {p}");
+        assert!(
+            s.contains(&format!("tcp.DstPort == {p}")),
+            "outbound missing {p}"
+        );
+        assert!(
+            s.contains(&format!("tcp.SrcPort == {p}")),
+            "inbound missing {p}"
+        );
     }
     compile_filter(&f.main, Layer::Network).expect("alt-port main filter accepted by WinDivert");
 }

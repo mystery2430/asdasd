@@ -1,3 +1,4 @@
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
@@ -72,6 +73,31 @@ const EVICT_EVERY: Duration = Duration::from_secs(60);
 /// platform-agnostic.
 pub type NetKeyFn = Arc<dyn Fn() -> (String, String) + Send + Sync>;
 
+/// Run one packet behind an unwind boundary. On panic the partial send batch is
+/// discarded, the original bytes/metadata are restored, and the caller forwards
+/// the untouched packet. Returning the panic flag lets the loop log it.
+fn guarded_process<F>(
+    data: &mut [u8],
+    meta: &mut CaptureMeta,
+    batch: &mut SendBatch,
+    process: F,
+) -> (Decision, bool)
+where
+    F: FnOnce(&mut [u8], &mut CaptureMeta, &mut SendBatch) -> Decision,
+{
+    let original_bytes = data.to_vec();
+    let original_meta = *meta;
+    match catch_unwind(AssertUnwindSafe(|| process(data, meta, batch))) {
+        Ok(decision) => (decision, false),
+        Err(_) => {
+            data.copy_from_slice(&original_bytes);
+            *meta = original_meta;
+            batch.items.clear();
+            (Decision::ForwardOriginal, true)
+        }
+    }
+}
+
 /// Everything scoped to one network. Swapped wholesale on a live rebind so the
 /// per-packet path never sees a half-updated view.
 struct NetworkSession {
@@ -114,7 +140,12 @@ fn build_session(
             ),
         }
     }
-    NetworkSession { discovery, censored: CensoredIps::default(), profile, net_human }
+    NetworkSession {
+        discovery,
+        censored: CensoredIps::default(),
+        profile,
+        net_human,
+    }
 }
 
 pub struct Engine {
@@ -148,6 +179,11 @@ pub struct Engine {
     /// Instant of the last *actual* rebind (`None` = never) — the
     /// `min_rebind_interval` anchor. The first rebind is never rate-limited.
     last_rebind_at: Mutex<Option<Instant>>,
+    /// Service-only safety net: when OS route notifications could not be
+    /// registered, poll the NetKey at this interval instead. `None` in the
+    /// normal event-driven mode, so no extra IP-Helper calls are made.
+    netkey_fallback: Mutex<Option<Duration>>,
+    last_netkey_poll: Mutex<Option<Instant>>,
 
     /// Cross-network ISP seed pool (feature C). `None` unless the CLI passed
     /// `--isp`. Held here so a live rebind can re-attach it to the new session's
@@ -179,6 +215,8 @@ impl Engine {
             netkey_dirty: AtomicBool::new(false),
             netkey_changed_at: Mutex::new(now),
             last_rebind_at: Mutex::new(None),
+            netkey_fallback: Mutex::new(None),
+            last_netkey_poll: Mutex::new(None),
             isp_pool: OnceLock::new(),
         }
     }
@@ -205,6 +243,19 @@ impl Engine {
     pub fn mark_netkey_dirty(&self) {
         self.netkey_dirty.store(true, Ordering::Relaxed);
         *self.netkey_changed_at.lock() = Instant::now();
+    }
+
+    /// Degraded-mode network detection for the Windows service: if the OS
+    /// notification watcher cannot start, poll the injected NetKey at `every`.
+    /// The normal event-driven path never calls the provider on an idle tick.
+    pub fn enable_netkey_fallback(&self, every: Duration) {
+        assert!(!every.is_zero(), "fallback interval must be non-zero");
+        *self.netkey_fallback.lock() = Some(every);
+    }
+
+    /// Diagnostics/tests: the polling interval, or `None` in event-driven mode.
+    pub fn netkey_fallback_interval(&self) -> Option<Duration> {
+        *self.netkey_fallback.lock()
     }
 
     pub fn config(&self) -> &EvasionConfig {
@@ -306,7 +357,13 @@ impl Engine {
             };
             log_outcome(&key, name.as_deref(), outcome, "packet");
             note_if_censored(&session.censored, &key, outcome, now);
-            self.feed_discovery(&session.discovery, target.as_deref(), trial, outcome, timing);
+            self.feed_discovery(
+                &session.discovery,
+                target.as_deref(),
+                trial,
+                outcome,
+                timing,
+            );
         }
 
         // --- strategy on outbound ClientHello ---
@@ -332,7 +389,11 @@ impl Engine {
         // Retransmit-aware: a strategy was already emitted for this flow's
         // ClientHello. A later ClientHello can only be a retransmit — pass it
         // through unchanged so it isn't re-desynced (avoids amplification).
-        if self.flows.peek(key, |st| st.strategy_applied).unwrap_or(false) {
+        if self
+            .flows
+            .peek(key, |st| st.strategy_applied)
+            .unwrap_or(false)
+        {
             tracing::debug!(
                 target: "bosphorus::strategy",
                 server_ip = %key.server_ip, client_port = key.client_port,
@@ -344,40 +405,56 @@ impl Engine {
         let hops = self.flows.peek(key, |st| st.hops_to_server).flatten();
 
         // Which strategy? forced override, or ask discovery.
-        let (target, strat, trial, discovered_ttl): (String, Option<Strategy>, TrialRecord, Option<u8>) =
-            match &self.forced {
-                Some(s) => {
-                    let target = sni_target(view.payload()).unwrap_or_else(|| key.server_ip.to_string());
-                    (
-                        target,
-                        Some(s.clone()),
-                        TrialRecord { id: Some(s.id()), kind: TrialKind::Exploit },
-                        None,
-                    )
-                }
-                None => {
-                    // Discovery must key by SNI. A fragmented / ECH ClientHello with
-                    // no readable SNI is NOT registered as an IP-keyed target and is
-                    // NOT mutated — it either reuses a target already learned for
-                    // this exact flow, or it passes through untouched.
-                    let target = match sni_target(view.payload())
-                        .or_else(|| self.flows.peek(key, |st| st.target_key.clone()).flatten())
-                    {
-                        Some(t) => t,
-                        None => {
-                            tracing::debug!(
-                                target: "bosphorus::discovery",
-                                server_ip = %key.server_ip, client_port = key.client_port,
-                                "ClientHello without readable SNI (fragmented/ECH); passthrough, no discovery"
-                            );
-                            return Decision::ForwardOriginal;
-                        }
-                    };
-                    let server_ttl = self.flows.peek(key, |st| st.remote_initial_ttl).flatten();
-                    let a = discovery.assign(&target, server_ttl);
-                    (target, a.strategy, TrialRecord { id: a.id, kind: a.kind }, a.discovered_ttl)
-                }
-            };
+        let (target, strat, trial, discovered_ttl): (
+            String,
+            Option<Strategy>,
+            TrialRecord,
+            Option<u8>,
+        ) = match &self.forced {
+            Some(s) => {
+                let target =
+                    sni_target(view.payload()).unwrap_or_else(|| key.server_ip.to_string());
+                (
+                    target,
+                    Some(s.clone()),
+                    TrialRecord {
+                        id: Some(s.id()),
+                        kind: TrialKind::Exploit,
+                    },
+                    None,
+                )
+            }
+            None => {
+                // Discovery must key by SNI. A fragmented / ECH ClientHello with
+                // no readable SNI is NOT registered as an IP-keyed target and is
+                // NOT mutated — it either reuses a target already learned for
+                // this exact flow, or it passes through untouched.
+                let target = match sni_target(view.payload())
+                    .or_else(|| self.flows.peek(key, |st| st.target_key.clone()).flatten())
+                {
+                    Some(t) => t,
+                    None => {
+                        tracing::debug!(
+                            target: "bosphorus::discovery",
+                            server_ip = %key.server_ip, client_port = key.client_port,
+                            "ClientHello without readable SNI (fragmented/ECH); passthrough, no discovery"
+                        );
+                        return Decision::ForwardOriginal;
+                    }
+                };
+                let server_ttl = self.flows.peek(key, |st| st.remote_initial_ttl).flatten();
+                let a = discovery.assign(&target, server_ttl);
+                (
+                    target,
+                    a.strategy,
+                    TrialRecord {
+                        id: a.id,
+                        kind: a.kind,
+                    },
+                    a.discovered_ttl,
+                )
+            }
+        };
 
         self.flows.with_mut(*key, now, |st| {
             st.target_key = Some(target.clone());
@@ -402,12 +479,14 @@ impl Engine {
         };
         match apply_strategy(&strat, &ctx, out) {
             Ok(Disposition::EmitBatchDropOriginal) => {
-                self.flows.with_mut(*key, now, |st| st.strategy_applied = true);
+                self.flows
+                    .with_mut(*key, now, |st| st.strategy_applied = true);
                 self.log_applied(&target, &strat, trial.kind, out.len());
                 Decision::ForwardBatchOnly
             }
             Ok(Disposition::EmitBatchThenOriginal) => {
-                self.flows.with_mut(*key, now, |st| st.strategy_applied = true);
+                self.flows
+                    .with_mut(*key, now, |st| st.strategy_applied = true);
                 self.log_applied(&target, &strat, trial.kind, out.len());
                 Decision::ForwardBatchThenOriginal
             }
@@ -522,7 +601,21 @@ impl Engine {
 
             let mut meta = captured.meta;
             let mut batch = SendBatch::new();
-            let decision = self.process(captured.data, &mut meta, &mut batch);
+            let (decision, panicked) =
+                guarded_process(captured.data, &mut meta, &mut batch, |data, meta, batch| {
+                    self.process(data, meta, batch)
+                });
+            if panicked {
+                // Do not inject anything the failing call staged. The original
+                // packet and its metadata have been restored, so forwarding it
+                // is the conservative, traffic-preserving recovery.
+                tracing::error!(
+                    target: "bosphorus::engine",
+                    bytes = captured.data.len(),
+                    outbound = meta.outbound,
+                    "panic while processing one packet; discarded partial batch and forwarded the original"
+                );
+            }
 
             match decision {
                 Decision::ForwardOriginal => {
@@ -561,7 +654,11 @@ impl Engine {
             // A timeout-resolved flow never carries a blocking packet to
             // fingerprint (DpiReset/LateReset only ever fire on the live
             // packet path above).
-            let timing = VerdictTiming { latency: rf.latency, retx: rf.retx, injector_hops: None };
+            let timing = VerdictTiming {
+                latency: rf.latency,
+                retx: rf.retx,
+                injector_hops: None,
+            };
             self.feed_discovery(
                 &session.discovery,
                 rf.target_key.as_deref(),
@@ -581,8 +678,49 @@ impl Engine {
     /// [`with_live_netkey`](Self::with_live_netkey) supplied a provider and
     /// [`mark_netkey_dirty`](Self::mark_netkey_dirty) armed it. Tick thread only.
     fn maybe_rebind(&self, now: Instant) {
-        let Some(provider) = self.netkey_provider.as_ref() else { return };
+        let Some(provider) = self.netkey_provider.as_ref() else {
+            return;
+        };
         if !self.netkey_dirty.load(Ordering::Relaxed) {
+            // Service fallback: only armed when the OS watcher failed to start.
+            // Poll no faster than the configured interval, then reuse the exact
+            // same key comparison/rebind path as a notification.
+            let due = {
+                let fallback = *self.netkey_fallback.lock();
+                match fallback {
+                    None => false,
+                    Some(every) => {
+                        let mut last = self.last_netkey_poll.lock();
+                        let due = last
+                            .map(|t| now.saturating_duration_since(t) >= every)
+                            .unwrap_or(true);
+                        if due {
+                            *last = Some(now);
+                        }
+                        due
+                    }
+                }
+            };
+            if !due {
+                return;
+            }
+            let (human, key) = provider();
+            let cur_key = self
+                .session
+                .load()
+                .profile
+                .as_ref()
+                .map(|p| p.net_key.clone())
+                .unwrap_or_else(|| "nonet".to_string());
+            if key != cur_key {
+                if let Some(last) = *self.last_rebind_at.lock() {
+                    if now.saturating_duration_since(last) < self.cfg.network.min_rebind_interval {
+                        return;
+                    }
+                }
+                self.rebind(&key, &human, now);
+                *self.last_rebind_at.lock() = Some(now);
+            }
             return;
         }
         let snap = *self.netkey_changed_at.lock();
@@ -641,7 +779,10 @@ impl Engine {
             .or_else(|| self.cfg.profile.as_ref().map(|p| p.dir.clone()));
         let profile = match (new_key, dir) {
             ("nonet", _) | (_, None) => None,
-            (k, Some(dir)) => Some(ProfilePaths { dir, net_key: k.to_string() }),
+            (k, Some(dir)) => Some(ProfilePaths {
+                dir,
+                net_key: k.to_string(),
+            }),
         };
 
         let session = build_session(&self.cfg, profile, Some(new_human.to_string()));
@@ -841,7 +982,9 @@ fn emit_batch(
 
 /// GoodbyeDPI `--wrong-chksum`: `Checksum = htons(ntohs(Checksum) - 1)`.
 fn break_tcp_checksum(bytes: &mut [u8]) {
-    let Ok(v) = PacketView::parse(bytes) else { return };
+    let Ok(v) = PacketView::parse(bytes) else {
+        return;
+    };
     if !v.is_tcp() {
         return;
     }
@@ -895,7 +1038,11 @@ mod tests {
             buf[..p.len()].copy_from_slice(p);
             Ok(Captured {
                 data: &mut buf[..p.len()],
-                meta: CaptureMeta { outbound: *outbound, raw: RawAddr::default(), ..Default::default() },
+                meta: CaptureMeta {
+                    outbound: *outbound,
+                    raw: RawAddr::default(),
+                    ..Default::default()
+                },
             })
         }
         fn shutdown(&mut self) -> Result<(), CoreError> {
@@ -931,12 +1078,16 @@ mod tests {
     }
 
     fn clienthello_pkt() -> Vec<u8> {
-        let mut p = vec![0x45, 0, 0, 0, 0, 0, 0x40, 0, 64, 6, 0, 0, 10, 0, 0, 5, 93, 184, 216, 34];
+        let mut p = vec![
+            0x45, 0, 0, 0, 0, 0, 0x40, 0, 64, 6, 0, 0, 10, 0, 0, 5, 93, 184, 216, 34,
+        ];
         p.extend_from_slice(&[0x30, 0x39, 0x01, 0xbb]); // 12345 -> 443
         p.extend_from_slice(&1_000u32.to_be_bytes());
         p.extend_from_slice(&2_000u32.to_be_bytes());
         p.extend_from_slice(&[0x50, 0x18, 0xff, 0xff, 0, 0, 0, 0]);
-        p.extend_from_slice(&[0x16, 0x03, 0x01, 0x00, 0x0a, 0x01, 0x00, 0x00, 0x06, 0x03, 0x03, 0xAA, 0xBB, 0xCC]);
+        p.extend_from_slice(&[
+            0x16, 0x03, 0x01, 0x00, 0x0a, 0x01, 0x00, 0x00, 0x06, 0x03, 0x03, 0xAA, 0xBB, 0xCC,
+        ]);
         let total = p.len() as u16;
         p[2..4].copy_from_slice(&total.to_be_bytes());
         p
@@ -972,7 +1123,9 @@ mod tests {
         let mut tls = vec![0x16, 0x03, 0x01];
         tls.extend_from_slice(&(hs.len() as u16).to_be_bytes());
         tls.extend_from_slice(&hs);
-        let mut p = vec![0x45, 0, 0, 0, 0, 0, 0x40, 0, 64, 6, 0, 0, 10, 0, 0, 5, 93, 184, 216, 34];
+        let mut p = vec![
+            0x45, 0, 0, 0, 0, 0, 0x40, 0, 64, 6, 0, 0, 10, 0, 0, 5, 93, 184, 216, 34,
+        ];
         p.extend_from_slice(&sport.to_be_bytes());
         p.extend_from_slice(&[0x01, 0xbb]);
         p.extend_from_slice(&1_000u32.to_be_bytes());
@@ -997,7 +1150,9 @@ mod tests {
         inbound_tcp_ttl(sport, 64, flags, payload)
     }
     fn inbound_tcp_ttl(sport: u16, ttl: u8, flags: u8, payload: &[u8]) -> Vec<u8> {
-        let mut p = vec![0x45, 0, 0, 0, 0, 0, 0x40, 0, ttl, 6, 0, 0, 93, 184, 216, 34, 10, 0, 0, 5];
+        let mut p = vec![
+            0x45, 0, 0, 0, 0, 0, 0x40, 0, ttl, 6, 0, 0, 93, 184, 216, 34, 10, 0, 0, 5,
+        ];
         p.extend_from_slice(&[0x01, 0xbb]);
         p.extend_from_slice(&sport.to_be_bytes());
         p.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0x50, flags, 0xff, 0xff, 0, 0, 0, 0]);
@@ -1016,16 +1171,25 @@ mod tests {
     /// Real inbound application data — confirms a handshake `Success` without
     /// waiting out the `app_grace` window.
     fn inbound_appdata(sport: u16) -> Vec<u8> {
-        inbound_tcp(sport, 0x18, &[0x17, 0x03, 0x03, 0x00, 0x03, 0xaa, 0xbb, 0xcc])
+        inbound_tcp(
+            sport,
+            0x18,
+            &[0x17, 0x03, 0x03, 0x00, 0x03, 0xaa, 0xbb, 0xcc],
+        )
     }
 
     #[test]
     fn non_ip_packets_pass_through_unchanged() {
         let pkts = vec![(vec![1u8, 2, 3], true), (vec![9u8; 40], false)];
-        let mut src = VecSource { packets: pkts.clone(), idx: 0 };
+        let mut src = VecSource {
+            packets: pkts.clone(),
+            idx: 0,
+        };
         let mut sink = RecSink::default();
         let engine = Engine::new(EvasionConfig::default());
-        let stats = engine.run_main(&mut src, &mut sink, &StopFlag::new()).unwrap();
+        let stats = engine
+            .run_main(&mut src, &mut sink, &StopFlag::new())
+            .unwrap();
 
         assert_eq!(stats.packets, 2);
         assert_eq!(stats.dropped, 0);
@@ -1036,7 +1200,10 @@ mod tests {
     fn forced_strategy_gets_fake_plus_two_segments_and_conntrack_state() {
         let engine = Engine::new_with_strategy(EvasionConfig::default(), Strategy::m4_fixed());
         let mut ch = clienthello_pkt();
-        let mut meta = CaptureMeta { outbound: true, ..Default::default() };
+        let mut meta = CaptureMeta {
+            outbound: true,
+            ..Default::default()
+        };
         let mut out = SendBatch::new();
 
         let decision = engine.process(&mut ch, &mut meta, &mut out);
@@ -1050,7 +1217,10 @@ mod tests {
             server_ip: "93.184.216.34".parse().unwrap(),
             server_port: 443,
         };
-        assert!(engine.flows().peek(&key, |st| st.client_hello_seen).unwrap());
+        assert!(engine
+            .flows()
+            .peek(&key, |st| st.client_hello_seen)
+            .unwrap());
 
         // Batch: fake, then two real segments.
         let f = PacketView::parse(&out.items[0].bytes).unwrap();
@@ -1063,11 +1233,16 @@ mod tests {
 
     #[test]
     fn run_main_recalculates_checksums_for_the_batch() {
-        let mut src = VecSource { packets: vec![(clienthello_pkt(), true)], idx: 0 };
+        let mut src = VecSource {
+            packets: vec![(clienthello_pkt(), true)],
+            idx: 0,
+        };
         let mut sink = RecSink::default();
         let engine = Engine::new_with_strategy(EvasionConfig::default(), Strategy::m4_fixed());
 
-        let stats = engine.run_main(&mut src, &mut sink, &StopFlag::new()).unwrap();
+        let stats = engine
+            .run_main(&mut src, &mut sink, &StopFlag::new())
+            .unwrap();
 
         assert_eq!(sink.recalc_calls, 3, "one per batch item");
         assert_eq!(sink.injected.len(), 3);
@@ -1076,10 +1251,16 @@ mod tests {
     }
 
     fn out_meta() -> CaptureMeta {
-        CaptureMeta { outbound: true, ..Default::default() }
+        CaptureMeta {
+            outbound: true,
+            ..Default::default()
+        }
     }
     fn in_meta() -> CaptureMeta {
-        CaptureMeta { outbound: false, ..Default::default() }
+        CaptureMeta {
+            outbound: false,
+            ..Default::default()
+        }
     }
 
     #[test]
@@ -1089,19 +1270,29 @@ mod tests {
         // 1) first ClientHello for a fresh target -> Probe control, unchanged.
         let mut ch = ch_with_sni("updates.discord.com", 40001);
         let mut out = SendBatch::new();
-        assert_eq!(engine.process(&mut ch, &mut out_meta(), &mut out), Decision::ForwardOriginal);
+        assert_eq!(
+            engine.process(&mut ch, &mut out_meta(), &mut out),
+            Decision::ForwardOriginal
+        );
         assert!(out.is_empty());
         assert_eq!(engine.discovery_summary()[0].phase, NetPhase::Probe);
         assert_eq!(engine.discovery_summary()[0].key, "updates.discord.com");
 
         // 2) DPI RST for that flow -> discovery learns the target is blocked.
-        engine.process(&mut inbound_rst(40001), &mut in_meta(), &mut SendBatch::new());
+        engine.process(
+            &mut inbound_rst(40001),
+            &mut in_meta(),
+            &mut SendBatch::new(),
+        );
         assert_eq!(engine.discovery_summary()[0].phase, NetPhase::Discover);
 
         // 3) next ClientHello (new port = new flow) -> a grid candidate is applied.
         let mut ch2 = ch_with_sni("updates.discord.com", 40002);
         let mut out2 = SendBatch::new();
-        assert_eq!(engine.process(&mut ch2, &mut out_meta(), &mut out2), Decision::ForwardBatchOnly);
+        assert_eq!(
+            engine.process(&mut ch2, &mut out_meta(), &mut out2),
+            Decision::ForwardBatchOnly
+        );
         assert_eq!(out2.len(), 3);
     }
 
@@ -1111,8 +1302,16 @@ mod tests {
         let engine = Engine::new(EvasionConfig::default());
 
         // Probe fails -> Discover.
-        engine.process(&mut ch_with_sni("blocked.example", 41000), &mut out_meta(), &mut SendBatch::new());
-        engine.process(&mut inbound_rst(41000), &mut in_meta(), &mut SendBatch::new());
+        engine.process(
+            &mut ch_with_sni("blocked.example", 41000),
+            &mut out_meta(),
+            &mut SendBatch::new(),
+        );
+        engine.process(
+            &mut inbound_rst(41000),
+            &mut in_meta(),
+            &mut SendBatch::new(),
+        );
         assert_eq!(engine.discovery_summary()[0].phase, NetPhase::Discover);
 
         // Two fresh connections, each: candidate applied, then ServerHello +
@@ -1126,8 +1325,16 @@ mod tests {
                 Decision::ForwardBatchOnly,
                 "iteration {i}"
             );
-            engine.process(&mut inbound_serverhello(port), &mut in_meta(), &mut SendBatch::new());
-            engine.process(&mut inbound_appdata(port), &mut in_meta(), &mut SendBatch::new());
+            engine.process(
+                &mut inbound_serverhello(port),
+                &mut in_meta(),
+                &mut SendBatch::new(),
+            );
+            engine.process(
+                &mut inbound_appdata(port),
+                &mut in_meta(),
+                &mut SendBatch::new(),
+            );
         }
 
         let s = engine.discovery_summary();
@@ -1151,11 +1358,27 @@ mod tests {
         // Session 1: block a target, fail two candidates, persist on shutdown.
         {
             let e = Engine::new(cfg());
-            e.process(&mut ch_with_sni("blocked.example", 47001), &mut out_meta(), &mut SendBatch::new());
-            e.process(&mut inbound_rst(47001), &mut in_meta(), &mut SendBatch::new()); // -> Discover
+            e.process(
+                &mut ch_with_sni("blocked.example", 47001),
+                &mut out_meta(),
+                &mut SendBatch::new(),
+            );
+            e.process(
+                &mut inbound_rst(47001),
+                &mut in_meta(),
+                &mut SendBatch::new(),
+            ); // -> Discover
             for port in [47002u16, 47003] {
-                e.process(&mut ch_with_sni("blocked.example", port), &mut out_meta(), &mut SendBatch::new());
-                e.process(&mut inbound_rst(port), &mut in_meta(), &mut SendBatch::new());
+                e.process(
+                    &mut ch_with_sni("blocked.example", port),
+                    &mut out_meta(),
+                    &mut SendBatch::new(),
+                );
+                e.process(
+                    &mut inbound_rst(port),
+                    &mut in_meta(),
+                    &mut SendBatch::new(),
+                );
             }
             assert!(e.discovery_summary()[0].tried >= 2);
             e.persist_now();
@@ -1165,8 +1388,15 @@ mod tests {
         {
             let e = Engine::new(cfg());
             let s = e.discovery_summary();
-            let ts = s.iter().find(|t| t.key == "blocked.example").expect("target restored from disk");
-            assert!(ts.tried >= 2, "sweep progress restored (tried={})", ts.tried);
+            let ts = s
+                .iter()
+                .find(|t| t.key == "blocked.example")
+                .expect("target restored from disk");
+            assert!(
+                ts.tried >= 2,
+                "sweep progress restored (tried={})",
+                ts.tried
+            );
             assert!(ts.from_disk);
         }
     }
@@ -1189,9 +1419,15 @@ mod tests {
         };
         let engine = Engine::new_with_strategy(EvasionConfig::default(), strat);
         let mut ch = ch_with_sni("updates.discord.com", 46001);
-        let mut meta = CaptureMeta { outbound: true, ..Default::default() };
+        let mut meta = CaptureMeta {
+            outbound: true,
+            ..Default::default()
+        };
         let mut out = SendBatch::new();
-        assert_eq!(engine.process(&mut ch, &mut meta, &mut out), Decision::ForwardBatchOnly);
+        assert_eq!(
+            engine.process(&mut ch, &mut meta, &mut out),
+            Decision::ForwardBatchOnly
+        );
         assert_eq!(out.len(), 4, "3 cut points -> 4 segments, no fake");
 
         let orig = ch_with_sni("updates.discord.com", 46001);
@@ -1201,7 +1437,10 @@ mod tests {
             .iter()
             .flat_map(|i| PacketView::parse(&i.bytes).unwrap().payload().to_vec())
             .collect();
-        assert_eq!(cat, orig_payload, "segments reassemble to the original ClientHello");
+        assert_eq!(
+            cat, orig_payload,
+            "segments reassemble to the original ClientHello"
+        );
     }
 
     #[test]
@@ -1209,18 +1448,32 @@ mod tests {
         let engine = Engine::new(EvasionConfig::default());
 
         // Probe fails -> Discover.
-        engine.process(&mut ch_with_sni("updates.discord.com", 45001), &mut out_meta(), &mut SendBatch::new());
-        engine.process(&mut inbound_rst(45001), &mut in_meta(), &mut SendBatch::new());
+        engine.process(
+            &mut ch_with_sni("updates.discord.com", 45001),
+            &mut out_meta(),
+            &mut SendBatch::new(),
+        );
+        engine.process(
+            &mut inbound_rst(45001),
+            &mut in_meta(),
+            &mut SendBatch::new(),
+        );
         assert_eq!(engine.discovery_summary()[0].phase, NetPhase::Discover);
 
         // Two fresh connections, no verdict in between.
         let mut a = ch_with_sni("updates.discord.com", 45002);
         let mut oa = SendBatch::new();
-        assert_eq!(engine.process(&mut a, &mut out_meta(), &mut oa), Decision::ForwardBatchOnly);
+        assert_eq!(
+            engine.process(&mut a, &mut out_meta(), &mut oa),
+            Decision::ForwardBatchOnly
+        );
 
         let mut b = ch_with_sni("updates.discord.com", 45003);
         let mut ob = SendBatch::new();
-        assert_eq!(engine.process(&mut b, &mut out_meta(), &mut ob), Decision::ForwardBatchOnly);
+        assert_eq!(
+            engine.process(&mut b, &mut out_meta(), &mut ob),
+            Decision::ForwardBatchOnly
+        );
 
         // Both are counted in flight and they used different candidates.
         let ts = &engine.discovery_summary()[0];
@@ -1237,8 +1490,16 @@ mod tests {
         let engine = Engine::new(EvasionConfig::default());
 
         // Connection A: SNI readable -> target "updates.discord.com", then blocked.
-        engine.process(&mut ch_with_sni("updates.discord.com", 42001), &mut out_meta(), &mut SendBatch::new());
-        engine.process(&mut inbound_rst(42001), &mut in_meta(), &mut SendBatch::new());
+        engine.process(
+            &mut ch_with_sni("updates.discord.com", 42001),
+            &mut out_meta(),
+            &mut SendBatch::new(),
+        );
+        engine.process(
+            &mut inbound_rst(42001),
+            &mut in_meta(),
+            &mut SendBatch::new(),
+        );
         assert_eq!(engine.discovery_summary()[0].phase, NetPhase::Discover);
 
         // Connection B: SAME server, but the captured ClientHello segment has no
@@ -1249,17 +1510,27 @@ mod tests {
         let tl = b.len() as u16;
         b[2..4].copy_from_slice(&tl.to_be_bytes());
         let mut out = SendBatch::new();
-        assert_eq!(engine.process(&mut b, &mut out_meta(), &mut out), Decision::ForwardOriginal);
+        assert_eq!(
+            engine.process(&mut b, &mut out_meta(), &mut out),
+            Decision::ForwardOriginal
+        );
         assert!(out.is_empty(), "no-SNI ClientHello must not be mutated");
 
         let s = engine.discovery_summary();
-        assert_eq!(s.len(), 1, "exactly one discovery target — no IP-keyed junk");
+        assert_eq!(
+            s.len(),
+            1,
+            "exactly one discovery target — no IP-keyed junk"
+        );
         assert_eq!(s[0].key, "updates.discord.com");
 
         // Connection C: full SNI again -> the same target keeps sweeping.
         let mut c = ch_with_sni("updates.discord.com", 42003);
         let mut oc = SendBatch::new();
-        assert_eq!(engine.process(&mut c, &mut out_meta(), &mut oc), Decision::ForwardBatchOnly);
+        assert_eq!(
+            engine.process(&mut c, &mut out_meta(), &mut oc),
+            Decision::ForwardBatchOnly
+        );
         assert_eq!(engine.discovery_summary().len(), 1);
     }
 
@@ -1270,13 +1541,19 @@ mod tests {
         // *.discord.media voice signalling rides Cloudflare's 2096 - must be mutated.
         let mut ch = ch_with_sni_dport("c-fra07.discord.media", 48001, 2096);
         let mut out = SendBatch::new();
-        assert_eq!(engine.process(&mut ch, &mut out_meta(), &mut out), Decision::ForwardBatchOnly);
+        assert_eq!(
+            engine.process(&mut ch, &mut out_meta(), &mut out),
+            Decision::ForwardBatchOnly
+        );
         assert!(!out.is_empty(), "strategy not applied on port 2096");
 
         // A non-TLS port is left alone.
         let mut other = ch_with_sni_dport("example.com", 48002, 8080);
         let mut o2 = SendBatch::new();
-        assert_eq!(engine.process(&mut other, &mut out_meta(), &mut o2), Decision::ForwardOriginal);
+        assert_eq!(
+            engine.process(&mut other, &mut out_meta(), &mut o2),
+            Decision::ForwardOriginal
+        );
         assert!(o2.is_empty());
     }
 
@@ -1287,13 +1564,19 @@ mod tests {
         // First ClientHello -> strategy applied.
         let mut ch = ch_with_sni("blocked.example", 43001);
         let mut o1 = SendBatch::new();
-        assert_eq!(engine.process(&mut ch, &mut out_meta(), &mut o1), Decision::ForwardBatchOnly);
+        assert_eq!(
+            engine.process(&mut ch, &mut out_meta(), &mut o1),
+            Decision::ForwardBatchOnly
+        );
         assert!(!o1.is_empty());
 
         // Same flow, another ClientHello (a retransmit) -> unchanged, no batch.
         let mut ch2 = ch_with_sni("blocked.example", 43001);
         let mut o2 = SendBatch::new();
-        assert_eq!(engine.process(&mut ch2, &mut out_meta(), &mut o2), Decision::ForwardOriginal);
+        assert_eq!(
+            engine.process(&mut ch2, &mut out_meta(), &mut o2),
+            Decision::ForwardOriginal
+        );
         assert!(o2.is_empty());
     }
 
@@ -1314,7 +1597,13 @@ mod tests {
             server_ip: "93.184.216.34".parse().unwrap(),
             server_port: 443,
         };
-        assert_eq!(engine.flows().peek(&key, |st| st.remote_initial_ttl).flatten(), Some(128));
+        assert_eq!(
+            engine
+                .flows()
+                .peek(&key, |st| st.remote_initial_ttl)
+                .flatten(),
+            Some(128)
+        );
     }
 
     #[test]
@@ -1346,11 +1635,16 @@ mod tests {
             order: SendOrder::FakeThenReal,
             tls_pad: None,
         };
-        let mut src = VecSource { packets: vec![(clienthello_pkt(), true)], idx: 0 };
+        let mut src = VecSource {
+            packets: vec![(clienthello_pkt(), true)],
+            idx: 0,
+        };
         let mut sink = RecSink::default();
         let engine = Engine::new_with_strategy(EvasionConfig::default(), strat);
 
-        let stats = engine.run_main(&mut src, &mut sink, &StopFlag::new()).unwrap();
+        let stats = engine
+            .run_main(&mut src, &mut sink, &StopFlag::new())
+            .unwrap();
         assert_eq!(sink.injected.len(), 3);
         assert_eq!(sink.recalc_calls, 3); // break op still recalcs first
         assert_eq!(stats.batches, 1);
@@ -1387,9 +1681,21 @@ mod tests {
         let (engine, cell) = live_engine(dir.path(), "keyA");
 
         // keyA session: block a target -> it has discovery + flow state.
-        engine.process(&mut ch_with_sni("blocked.example", 51001), &mut out_meta(), &mut SendBatch::new());
-        engine.process(&mut inbound_rst(51001), &mut in_meta(), &mut SendBatch::new());
-        engine.process(&mut ch_with_sni("blocked.example", 51002), &mut out_meta(), &mut SendBatch::new());
+        engine.process(
+            &mut ch_with_sni("blocked.example", 51001),
+            &mut out_meta(),
+            &mut SendBatch::new(),
+        );
+        engine.process(
+            &mut inbound_rst(51001),
+            &mut in_meta(),
+            &mut SendBatch::new(),
+        );
+        engine.process(
+            &mut ch_with_sni("blocked.example", 51002),
+            &mut out_meta(),
+            &mut SendBatch::new(),
+        );
         assert!(engine.flows().stats().0 > 0, "flows populated");
         assert!(!engine.discovery_summary().is_empty(), "keyA has a target");
         assert_eq!(engine.current_profile().unwrap().net_key, "keyA");
@@ -1400,9 +1706,20 @@ mod tests {
         engine.mark_netkey_dirty();
         engine.tick(t0 + Duration::from_secs(10));
 
-        assert_eq!(engine.current_profile().unwrap().net_key, "keyB", "session swapped");
-        assert_eq!(engine.flows().stats().0, 0, "stale conntrack cleared on rebind");
-        assert!(engine.discovery_summary().is_empty(), "fresh session for keyB (nothing on disk)");
+        assert_eq!(
+            engine.current_profile().unwrap().net_key,
+            "keyB",
+            "session swapped"
+        );
+        assert_eq!(
+            engine.flows().stats().0,
+            0,
+            "stale conntrack cleared on rebind"
+        );
+        assert!(
+            engine.discovery_summary().is_empty(),
+            "fresh session for keyB (nothing on disk)"
+        );
         assert!(
             crate::profile::persist::profile_path(dir.path(), "keyA").exists(),
             "old network's learned state flushed to its own file on the way out"
@@ -1418,10 +1735,74 @@ mod tests {
         engine.mark_netkey_dirty();
 
         engine.tick(t0 + Duration::from_secs(2)); // inside the 5s debounce
-        assert_eq!(engine.current_profile().unwrap().net_key, "keyA", "still settling");
+        assert_eq!(
+            engine.current_profile().unwrap().net_key,
+            "keyA",
+            "still settling"
+        );
 
         engine.tick(t0 + Duration::from_secs(8)); // quiet period elapsed
-        assert_eq!(engine.current_profile().unwrap().net_key, "keyB", "rebound after debounce");
+        assert_eq!(
+            engine.current_profile().unwrap().net_key,
+            "keyB",
+            "rebound after debounce"
+        );
+    }
+
+    #[test]
+    fn fallback_polling_is_off_by_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&calls);
+        let provider: crate::engine::NetKeyFn = Arc::new(move || {
+            count.fetch_add(1, Ordering::SeqCst);
+            ("human".into(), "keyA".into())
+        });
+        let cfg = EvasionConfig {
+            profile: Some(crate::config::ProfilePaths {
+                dir: dir.path().into(),
+                net_key: "keyA".into(),
+            }),
+            ..Default::default()
+        };
+        let engine = Engine::with_live_netkey(cfg, provider);
+        engine.tick(Instant::now() + Duration::from_secs(600));
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "no polling without the fallback"
+        );
+    }
+
+    #[test]
+    fn fallback_poll_rebinds_when_the_network_key_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let (engine, cell) = live_engine(dir.path(), "keyA");
+        engine.enable_netkey_fallback(Duration::from_secs(30));
+        let t0 = Instant::now();
+        engine.tick(t0); // prime the polling clock without changing networks
+
+        engine.tick(t0 + Duration::from_secs(10));
+        assert_eq!(
+            engine.current_profile().unwrap().net_key,
+            "keyA",
+            "interval not elapsed"
+        );
+
+        *cell.lock() = "keyB".into();
+        engine.tick(t0 + Duration::from_secs(31));
+        assert_eq!(
+            engine.current_profile().unwrap().net_key,
+            "keyB",
+            "fallback detects a change the failed watcher would have missed"
+        );
+    }
+
+    #[test]
+    fn a_live_watcher_mode_does_not_enable_fallback_automatically() {
+        let dir = tempfile::tempdir().unwrap();
+        let (engine, _cell) = live_engine(dir.path(), "keyA");
+        assert!(engine.netkey_fallback.lock().is_none());
     }
 
     #[test]
@@ -1429,7 +1810,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (engine, _cell) = live_engine(dir.path(), "keyA"); // provider keeps returning keyA
 
-        engine.process(&mut ch_with_sni("blocked.example", 52001), &mut out_meta(), &mut SendBatch::new());
+        engine.process(
+            &mut ch_with_sni("blocked.example", 52001),
+            &mut out_meta(),
+            &mut SendBatch::new(),
+        );
         let flows_before = engine.flows().stats().0;
         assert!(flows_before > 0);
 
@@ -1438,7 +1823,11 @@ mod tests {
         engine.tick(t0 + Duration::from_secs(8)); // debounce passed; recompute == "keyA"
 
         assert_eq!(engine.current_profile().unwrap().net_key, "keyA");
-        assert_eq!(engine.flows().stats().0, flows_before, "no rebind -> flows untouched");
+        assert_eq!(
+            engine.flows().stats().0,
+            flows_before,
+            "no rebind -> flows untouched"
+        );
         assert!(
             !engine.netkey_dirty.load(Ordering::Relaxed),
             "dirty cleared on a same-key recompute"
@@ -1461,11 +1850,22 @@ mod tests {
         *cell.lock() = "keyC".into();
         engine.mark_netkey_dirty();
         engine.tick(t0 + Duration::from_secs(20)); // 20 - 8 = 12s < 30s
-        assert_eq!(engine.current_profile().unwrap().net_key, "keyB", "rate-limited, not yet rebound");
-        assert!(engine.netkey_dirty.load(Ordering::Relaxed), "stays armed while rate-limited");
+        assert_eq!(
+            engine.current_profile().unwrap().net_key,
+            "keyB",
+            "rate-limited, not yet rebound"
+        );
+        assert!(
+            engine.netkey_dirty.load(Ordering::Relaxed),
+            "stays armed while rate-limited"
+        );
 
         engine.tick(t0 + Duration::from_secs(45)); // 45 - 8 = 37s >= 30s
-        assert_eq!(engine.current_profile().unwrap().net_key, "keyC", "rebinds once the interval elapses");
+        assert_eq!(
+            engine.current_profile().unwrap().net_key,
+            "keyC",
+            "rebinds once the interval elapses"
+        );
     }
 
     #[test]
@@ -1473,19 +1873,38 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (engine, cell) = live_engine(dir.path(), "keyA");
 
-        engine.process(&mut ch_with_sni("blocked.example", 53001), &mut out_meta(), &mut SendBatch::new());
-        engine.process(&mut inbound_rst(53001), &mut in_meta(), &mut SendBatch::new());
+        engine.process(
+            &mut ch_with_sni("blocked.example", 53001),
+            &mut out_meta(),
+            &mut SendBatch::new(),
+        );
+        engine.process(
+            &mut inbound_rst(53001),
+            &mut in_meta(),
+            &mut SendBatch::new(),
+        );
 
         // Network lost -> provider returns "nonet".
         *cell.lock() = "nonet".into();
         let t0 = Instant::now();
         engine.mark_netkey_dirty();
         engine.tick(t0 + Duration::from_secs(8));
-        assert!(engine.current_profile().is_none(), "nonet -> no profile path");
+        assert!(
+            engine.current_profile().is_none(),
+            "nonet -> no profile path"
+        );
 
         // Learn something on the nonet session, then force writes.
-        engine.process(&mut ch_with_sni("other.example", 53002), &mut out_meta(), &mut SendBatch::new());
-        engine.process(&mut inbound_rst(53002), &mut in_meta(), &mut SendBatch::new());
+        engine.process(
+            &mut ch_with_sni("other.example", 53002),
+            &mut out_meta(),
+            &mut SendBatch::new(),
+        );
+        engine.process(
+            &mut inbound_rst(53002),
+            &mut in_meta(),
+            &mut SendBatch::new(),
+        );
         engine.persist_now();
         engine.tick(t0 + Duration::from_secs(60)); // maybe_persist path too
 
@@ -1512,8 +1931,16 @@ mod tests {
         let t0 = Instant::now();
 
         // keyA: block a.example -> Discover.
-        engine.process(&mut ch_with_sni("a.example", 60001), &mut out_meta(), &mut SendBatch::new());
-        engine.process(&mut inbound_rst(60001), &mut in_meta(), &mut SendBatch::new());
+        engine.process(
+            &mut ch_with_sni("a.example", 60001),
+            &mut out_meta(),
+            &mut SendBatch::new(),
+        );
+        engine.process(
+            &mut inbound_rst(60001),
+            &mut in_meta(),
+            &mut SendBatch::new(),
+        );
         assert_eq!(engine.discovery_summary()[0].phase, NetPhase::Discover);
 
         // A -> B (flushes keyA/a.example to its own file).
@@ -1523,8 +1950,16 @@ mod tests {
         assert_eq!(engine.current_profile().unwrap().net_key, "keyB");
 
         // keyB: block b.example -> Discover.
-        engine.process(&mut ch_with_sni("b.example", 60002), &mut out_meta(), &mut SendBatch::new());
-        engine.process(&mut inbound_rst(60002), &mut in_meta(), &mut SendBatch::new());
+        engine.process(
+            &mut ch_with_sni("b.example", 60002),
+            &mut out_meta(),
+            &mut SendBatch::new(),
+        );
+        engine.process(
+            &mut inbound_rst(60002),
+            &mut in_meta(),
+            &mut SendBatch::new(),
+        );
         assert_eq!(engine.discovery_summary()[0].phase, NetPhase::Discover);
 
         // B -> A (flushes keyB/b.example; reloads keyA -> a.example from disk).
@@ -1607,7 +2042,11 @@ mod tests {
         engine.mark_netkey_dirty();
         engine.tick(t0 + Duration::from_secs(10));
 
-        assert_eq!(engine.current_profile().unwrap().net_key, "keyB", "the rebind still happened");
+        assert_eq!(
+            engine.current_profile().unwrap().net_key,
+            "keyB",
+            "the rebind still happened"
+        );
         assert!(
             engine.netkey_dirty.load(Ordering::Relaxed),
             "a signal during the rebind must keep the flag armed (snap captured at entry)"
@@ -1620,6 +2059,50 @@ mod tests {
             !engine.netkey_dirty.load(Ordering::Relaxed),
             "with no signal during, the flag clears"
         );
+    }
+
+    // --- per-packet panic boundary ----------------------------------------
+
+    #[test]
+    fn a_panicking_packet_discards_its_partial_batch_and_forwards_the_original() {
+        let mut data = clienthello_pkt();
+        let original = data.clone();
+        let mut meta = out_meta();
+        let mut batch = SendBatch::new();
+        let (decision, panicked) =
+            guarded_process(&mut data, &mut meta, &mut batch, |data, meta, batch| {
+                data[0] = 0xff; // a half-applied mutation
+                meta.outbound = false;
+                batch.push(vec![0xde, 0xad], out_meta());
+                panic!("simulated packet-transform bug");
+            });
+
+        assert!(panicked, "the unwind must be caught at the packet boundary");
+        assert_eq!(decision, Decision::ForwardOriginal);
+        assert!(
+            batch.items.is_empty(),
+            "partial packets must never be injected"
+        );
+        assert_eq!(
+            data, original,
+            "the original packet is restored before forwarding"
+        );
+        assert!(meta.outbound, "the original metadata is restored too");
+    }
+
+    #[test]
+    fn a_normal_packet_keeps_its_decision_and_batch() {
+        let mut data = clienthello_pkt();
+        let mut meta = out_meta();
+        let mut batch = SendBatch::new();
+        let (decision, panicked) =
+            guarded_process(&mut data, &mut meta, &mut batch, |_, _, batch| {
+                batch.push(vec![0xca, 0xfe], out_meta());
+                Decision::ForwardBatchThenOriginal
+            });
+        assert!(!panicked);
+        assert_eq!(decision, Decision::ForwardBatchThenOriginal);
+        assert_eq!(batch.items.len(), 1, "normal packet staging is unchanged");
     }
 
     // --- QUIC -------------------------------------------------------------
@@ -1657,8 +2140,16 @@ mod tests {
 
     /// Drive a target to a `DpiReset` verdict, which is what marks its address.
     fn provoke_dpi_reset(engine: &Engine, host: &str, sport: u16) {
-        engine.process(&mut ch_with_sni(host, sport), &mut out_meta(), &mut SendBatch::new());
-        engine.process(&mut inbound_rst(sport), &mut in_meta(), &mut SendBatch::new());
+        engine.process(
+            &mut ch_with_sni(host, sport),
+            &mut out_meta(),
+            &mut SendBatch::new(),
+        );
+        engine.process(
+            &mut inbound_rst(sport),
+            &mut in_meta(),
+            &mut SendBatch::new(),
+        );
     }
 
     #[test]
@@ -1681,6 +2172,34 @@ mod tests {
             engine.process(&mut p, &mut out_meta(), &mut SendBatch::new()),
             Decision::DropOriginal,
             "the browser has to fall back to TCP for the learned strategy to apply"
+        );
+    }
+
+    #[test]
+    fn v2_and_unknown_version_initials_are_refused_too() {
+        let engine = Engine::new(EvasionConfig::default());
+        provoke_dpi_reset(&engine, "blocked.example", 40106);
+
+        // RFC 9369 v2 rotates the type bits: Initial is 0xD, not 0xC.
+        let mut v2 = quic_initial();
+        v2[0] = 0xD0;
+        v2[1..5].copy_from_slice(&crate::packet::quic::VERSION_2.to_be_bytes());
+        let mut v2_packet = quic_out(BLOCKED_DST, &v2);
+        assert_eq!(
+            engine.process(&mut v2_packet, &mut out_meta(), &mut SendBatch::new()),
+            Decision::DropOriginal,
+            "QUIC v2 must fall back to TCP like v1"
+        );
+
+        // A draft/future version has no Type-bit mapping; the parser treats a
+        // padded long header as a connection attempt rather than letting it by.
+        let mut unknown = quic_initial();
+        unknown[1..5].copy_from_slice(&0xff00_001du32.to_be_bytes());
+        let mut unknown_packet = quic_out(BLOCKED_DST, &unknown);
+        assert_eq!(
+            engine.process(&mut unknown_packet, &mut out_meta(), &mut SendBatch::new()),
+            Decision::DropOriginal,
+            "unknown QUIC versions must not bypass the policy"
         );
     }
 
@@ -1723,7 +2242,10 @@ mod tests {
 
     #[test]
     fn the_off_policy_never_refuses_quic() {
-        let cfg = EvasionConfig { quic: QuicPolicy::Off, ..Default::default() };
+        let cfg = EvasionConfig {
+            quic: QuicPolicy::Off,
+            ..Default::default()
+        };
         let engine = Engine::new(cfg);
         provoke_dpi_reset(&engine, "blocked.example", 40103);
 
@@ -1739,7 +2261,10 @@ mod tests {
         // `QuicPolicy::All` keeps UDP out of the capture filter entirely, so a
         // datagram reaching `process` at all would be a bug in the wiring; the
         // engine must not second-guess it either way.
-        let cfg = EvasionConfig { quic: QuicPolicy::All, ..Default::default() };
+        let cfg = EvasionConfig {
+            quic: QuicPolicy::All,
+            ..Default::default()
+        };
         let engine = Engine::new(cfg);
         provoke_dpi_reset(&engine, "blocked.example", 40104);
 
@@ -1768,7 +2293,11 @@ mod tests {
         // treated as proof of a censor.
         let engine = Engine::new(EvasionConfig::default());
         let t0 = Instant::now();
-        engine.process(&mut ch_with_sni("quiet.example", 40106), &mut out_meta(), &mut SendBatch::new());
+        engine.process(
+            &mut ch_with_sni("quiet.example", 40106),
+            &mut out_meta(),
+            &mut SendBatch::new(),
+        );
         engine.tick(t0 + Duration::from_secs(30)); // verdict timeout -> Blackhole
 
         let mut p = quic_out(BLOCKED_DST, &quic_initial());
@@ -1784,7 +2313,10 @@ mod tests {
         let k2 = Arc::clone(&key);
         let dir = std::env::temp_dir().join(format!("bosph-quic-rebind-{}", std::process::id()));
         let cfg = EvasionConfig {
-            profile: Some(ProfilePaths { dir: dir.clone(), net_key: "keyA".into() }),
+            profile: Some(ProfilePaths {
+                dir: dir.clone(),
+                net_key: "keyA".into(),
+            }),
             ..Default::default()
         };
         let engine = Engine::with_live_netkey(

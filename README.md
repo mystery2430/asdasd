@@ -110,7 +110,9 @@ narrow slice of traffic (filter fragments taken verbatim from GoodbyeDPI):
 
 Everything else on the machine is untouched. Non-IP and non-TCP packets pass
 straight through. The per-packet loop runs inside `catch_unwind`, so a single
-malformed packet degrades to one log line rather than killing the process.
+malformed packet degrades to one log line rather than killing the process. If a
+transform panics, its partial send batch is discarded, the original bytes and
+metadata are restored, and that original packet is forwarded.
 
 ### Connection tracking & verdicts
 
@@ -225,7 +227,7 @@ Who that applies to is the whole point:
 | `--quic` | What happens |
 |---|---|
 | `blocked` *(default)* | Only destinations where a censor was actually caught resetting a connection lose HTTP/3. Everything else keeps it. |
-| `all` | Every HTTP/3 connection on the machine is refused — GoodbyeDPI's approach. No learning needed; costs QUIC everywhere. |
+| `all` | Every HTTP/3 connection attempt on the machine is refused — GoodbyeDPI's approach, without its v1-only version pin. QUIC v1, v2 and unknown/draft versions are covered; ordinary UDP and established short-header QUIC packets are not matched. No learning needed; costs QUIC everywhere. |
 | `off` | QUIC is never touched. A blocked site may keep failing over HTTP/3. |
 
 Under the default, a destination is marked only by a **real reset** (`DpiReset`
@@ -334,10 +336,14 @@ A Cargo workspace of three crates:
   driver silently at boot. `service install` checks the driver loads before
   registering the service, and refuses (or warns, with `--force`) if it
   can't.
-- **A stable install path.** WinDivert registers its driver from wherever
-  `bosphorus.exe` lives; moving the executable later breaks the service and
-  the driver with it. Keep it somewhere permanent, or use
-  `service install --install-dir`.
+- **An administrator-controlled install path.** `service install` now always
+  copies `bosphorus.exe`, `WinDivert.dll` and `WinDivert64.sys` into
+  `%ProgramFiles%\Bosphorus` by default, so a LocalSystem service never loads
+  from Downloads or another user-writable folder. `--install-dir` overrides
+  the location, but the installer inspects that directory's real DACL and
+  refuses it when Everyone, INTERACTIVE, Authenticated Users or the built-in
+  Users group has write/delete rights. All three files must exist and be
+  copied successfully before the service is created.
 - **Rust (stable, 1.80 or newer)** targeting `x86_64-pc-windows-msvc`, to
   build from source.
 
@@ -508,15 +514,20 @@ bosphorus service uninstall [--purge]   # --purge also deletes saved data
 bosphorus service run                   # SCM entry point only, not for interactive use
 ```
 
-- `--install-dir` copies the executable and the WinDivert files into a
-  stable folder and registers the service from that copy.
+- Without `--install-dir`, the executable and both WinDivert files are copied
+  to `%ProgramFiles%\Bosphorus` and the service is registered from that copy.
+  `--install-dir` selects another administrator-controlled folder; a directory
+  writable by ordinary users is rejected before the service is created. A
+  missing or empty DLL/SYS is an error, not a warning.
 - The installer prints a short block of PowerShell commands that confirm the
   service and driver actually came up — worth running once, since a
   boot-time driver block is otherwise silent.
 - The service runs the same auto-discovery engine as `--engine` with no
   `--strategy`, with its own per-network profile store and log folder.
   Lifecycle events are also written to the Windows Application event log
-  under the provider name `Bosphorus`.
+  under the provider name `Bosphorus`. If route/address notifications cannot
+  be registered, the failure is logged there and the service falls back to a
+  30-second NetKey poll; the normal notification path does no polling.
 
 ## Files, folders & logs
 
@@ -575,8 +586,9 @@ Get-ChildItem "$env:ProgramData\Bosphorus\profiles\*.json" | Select Name, LastWr
   back onto TCP (see [the QUIC policy](#quic-and-http3)), where it does have a
   strategy — but it has no evasion strategies for QUIC itself, because the name
   inside a QUIC handshake is encrypted and there is nothing to split or shadow.
-- **DNS** redirection isn't implemented yet; DNS-based blocking is only
-  observable, not corrected.
+- **DNS** redirection isn't implemented. A non-`None` `dns_upstream` is now
+  rejected with an explicit configuration error: adding a UDP/53 capture clause
+  is not redirection. DNS-based blocking is only observable, not corrected.
 - **IP-layer fragmentation** was evaluated and deliberately shelved (too
   much blackhole risk, unverified on Windows).
 - **Domain fronting** is out of scope — it needs cooperation from the client

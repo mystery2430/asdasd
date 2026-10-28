@@ -44,9 +44,11 @@ pub struct EvasionConfig {
     /// `[443]` by the filter builder.
     pub tls_ports: Vec<u16>,
 
-    /// When `Some`, `udp/53` is added to the capture filter and DNS is
-    /// redirected to this address (M10). When `None`, DNS is never touched
-    /// (only poisoning detection is logged).
+    /// Reserved for DNS redirection, which is **not implemented**. Only `None`
+    /// is accepted today: [`crate::filter::build`] returns a configuration
+    /// error for `Some`, because capturing UDP/53 is not redirection and the
+    /// engine cannot rewrite request and response addresses/checksums. When
+    /// `None`, DNS is never touched (only poisoning detection is logged).
     pub dns_upstream: Option<IpAddr>,
 
     /// What to do about HTTP/3. See [`QuicPolicy`].
@@ -306,7 +308,10 @@ mod tests {
     #[test]
     fn quic_policy_parsing_is_forgiving_about_case_and_spacing() {
         assert_eq!(" OFF ".parse::<QuicPolicy>().unwrap(), QuicPolicy::Off);
-        assert_eq!("Blocked".parse::<QuicPolicy>().unwrap(), QuicPolicy::Blocked);
+        assert_eq!(
+            "Blocked".parse::<QuicPolicy>().unwrap(),
+            QuicPolicy::Blocked
+        );
         assert_eq!("auto".parse::<QuicPolicy>().unwrap(), QuicPolicy::Blocked);
         assert_eq!("none".parse::<QuicPolicy>().unwrap(), QuicPolicy::Off);
     }
