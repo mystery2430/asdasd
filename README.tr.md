@@ -111,9 +111,15 @@ trafik dilimini yakalar (filtre parçaları GoodbyeDPI'dan bire bir alınmışt�
 
 Makinedeki diğer her şeye dokunulmaz. IP olmayan ve TCP olmayan paketler
 doğrudan geçer. Paket başına döngü `catch_unwind` içinde çalışır; bozuk tek
-bir paket süreci öldürmek yerine tek satırlık bir günlüğe düşer. Bir dönüşüm
-panik yaparsa yarım gönderim listesi atılır, orijinal paket ve meta verisi geri
-yüklenir ve o paket değiştirilmeden iletilir.
+bir paket süreci öldürmek yerine tek satırlık bir günlüğe düşer.
+
+Bir dönüşüm panik yaparsa yarım gönderim listesi atılır ve yakalanan paket
+**değiştirilmeden** iletilir: motor yakalama tamponunu hiç değiştirmez (tampon
+paylaşılan referansla geçirilir), yani geri yüklenecek bir şey yoktur. Ardından
+yakalama durur, çünkü `process` strateji kurulmadan önce bağlantı takibini,
+discovery'yi ve akışın denemesini günceller; bir unwind sonrasında bu durum
+yarım kalmış bir denemeyi anlatıyor olabilir. Ona dayanarak karar vermeye devam
+etmek durmaktan daha kötüdür ve çağıran taraf paniği hata olarak bildirir.
 
 ### Bağlantı takibi ve kararlar
 
