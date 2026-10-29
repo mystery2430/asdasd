@@ -5,13 +5,19 @@ use crate::error::CoreError;
 use crate::filter::templates as t;
 
 /// The WinDivert filter strings for a run.
+///
+/// There is deliberately only one filter. An earlier revision opened a second
+/// `WINDIVERT_FLAG_DROP` handle whose filter claimed to match QUIC; a filter can
+/// only look at the first payload bytes and the length, so it also matched
+/// ordinary UDP/443 traffic and dropped it without any way to tell. QUIC
+/// candidates now come in on the main handle and are classified by
+/// [`crate::packet::quic`] before anything is dropped.
 #[derive(Debug)]
 pub struct Filters {
-    /// Main capture handle (divert mode): outbound 443 requests + inbound 443
-    /// SYN-ACK / RST / first-data(`16`) for verdict feedback.
+    /// Main capture handle (divert mode): outbound TLS requests + inbound
+    /// SYN-ACK / RST / first-data(`16`) for verdict feedback, plus QUIC
+    /// candidates when [`crate::config::QuicPolicy::wants_capture`].
     pub main: CString,
-    /// QUIC-drop handle (`WINDIVERT_FLAG_DROP`), when enabled.
-    pub quic_drop: Option<CString>,
 }
 
 /// `(tcp.DstPort == 443 or tcp.DstPort == 2083 or ...)` for `field`
@@ -33,10 +39,7 @@ pub fn build(cfg: &EvasionConfig) -> Result<Filters, CoreError> {
     // One source of truth with the packet parser: the coarse gate is the QUIC
     // long-header form bit. Requiring the fixed bit too (`0xC0`) missed long
     // headers whose fixed bit is greased to zero (RFC 9287).
-    let min_first_byte = format!(
-        "{:#04X}",
-        crate::packet::quic::LONG_HEADER_FIRST_BYTE_MIN
-    );
+    let min_first_byte = format!("{:#04X}", crate::packet::quic::LONG_HEADER_FIRST_BYTE_MIN);
 
     // Inbound verdict clause: SYN-ACK (passive TTL, M7), RST (DpiReset), and the
     // first data segment of a TLS response — `Payload[0] == 0x16` confirmed in
@@ -61,12 +64,13 @@ pub fn build(cfg: &EvasionConfig) -> Result<Filters, CoreError> {
 
     let mut main =
         format!("(tcp and !impostor and !loopback {maxpayload} and ({inbound} or {outbound}))");
-    if cfg.quic.wants_selective_capture() {
-        // The engine decides per destination, so these have to be captured
-        // rather than dropped in the driver.
+    if cfg.quic.wants_capture() {
+        // Both blocking policies need the datagram: the engine decides per
+        // destination for `blocked`, and `all` still needs the parser to tell a
+        // QUIC Initial from an ordinary UDP datagram that merely looks like one.
         main.push_str(" or ");
         main.push_str(
-            &t::QUIC_SELECTIVE_FMT
+            &t::QUIC_CAPTURE_FMT
                 .replace("{dst_ports}", &port_clause(ports, "udp.DstPort"))
                 .replace("{v4dst}", t::NO_LOCALNETS_V4_DST)
                 .replace("{v6dst}", t::NO_LOCALNETS_V6_DST)
@@ -84,14 +88,8 @@ pub fn build(cfg: &EvasionConfig) -> Result<Filters, CoreError> {
 
     let main =
         CString::new(main).map_err(|_| CoreError::Filter("main filter has interior NUL".into()))?;
-    let quic_drop = if cfg.quic.wants_blanket_drop() {
-        let filter = t::QUIC_DROP.replace("{min_first_byte}", &min_first_byte);
-        Some(CString::new(filter).map_err(|_| CoreError::Filter("quic filter has interior NUL".into()))?)
-    } else {
-        None
-    };
 
-    Ok(Filters { main, quic_drop })
+    Ok(Filters { main })
 }
 
 #[cfg(test)]
@@ -109,10 +107,9 @@ mod tests {
         let f = build(&EvasionConfig::default()).unwrap();
         let s = f.main.to_str().unwrap();
         assert_eq!(count(s, '('), count(s, ')'), "main: {s}");
-        assert!(
-            f.quic_drop.is_none(),
-            "selective QUIC needs capture, not a drop handle"
-        );
+        // One handle only: QUIC is classified by the engine, never dropped by a
+        // driver filter that cannot tell it from ordinary UDP.
+        assert!(s.contains("udp.DstPort == 443"), "{s}");
     }
 
     #[test]
@@ -155,45 +152,57 @@ mod tests {
     }
 
     #[test]
-    fn quic_off_touches_neither_the_filter_nor_the_drop_handle() {
+    fn quic_off_captures_no_udp_at_all() {
         let cfg = EvasionConfig {
             quic: QuicPolicy::Off,
             ..Default::default()
         };
-        let f = build(&cfg).unwrap();
-        let s = f.main.to_str().unwrap();
+        let s = build(&cfg).unwrap().main.into_string().unwrap();
         assert!(!s.contains("udp"), "no UDP capture at all: {s}");
-        assert!(f.quic_drop.is_none());
     }
 
     #[test]
-    fn quic_all_drops_in_the_driver_instead_of_capturing() {
+    fn quic_all_captures_candidates_for_the_engine_instead_of_dropping_them() {
+        // Regression: `all` used to open a WINDIVERT_FLAG_DROP handle whose only
+        // test was "large UDP on 443 starting with a high byte". That silently
+        // discarded non-QUIC UDP and could not be corrected later, because the
+        // driver never delivered the packet. `all` must now behave like
+        // `blocked` at capture time and let the parser decide.
         let cfg = EvasionConfig {
             quic: QuicPolicy::All,
             ..Default::default()
         };
-        let f = build(&cfg).unwrap();
-        assert!(!f.main.to_str().unwrap().contains("udp"));
-        let drop_filter = f.quic_drop.unwrap().into_string().unwrap();
-        // The v1-only version field must not reappear: it misses v2 and drafts.
-        assert!(!drop_filter.contains("Payload32[1b]"), "{drop_filter}");
-        assert!(drop_filter.contains("udp.PayloadLength >= 1200"));
-        // The gate is the long-header form bit alone (0x80), shared with the
-        // packet parser. `0xC0` also required the fixed bit, which RFC 9287 lets
-        // endpoints grease to zero, so those Initials escaped the blanket drop.
+        let s = build(&cfg).unwrap().main.into_string().unwrap();
+        assert!(s.contains("udp.DstPort == 443"), "no QUIC capture: {s}");
+        assert!(s.contains("udp.PayloadLength >= 1200"), "{s}");
         let gate = format!(
             "udp.Payload[0] >= {:#04X}",
             crate::packet::quic::LONG_HEADER_FIRST_BYTE_MIN
         );
-        assert!(drop_filter.contains(&gate), "drop gate missing {gate}: {drop_filter}");
-        assert!(!drop_filter.contains("0xC0"), "fixed bit must not be required: {drop_filter}");
-        assert_eq!(
-            drop_filter,
-            t::QUIC_DROP.replace(
-                "{min_first_byte}",
-                &format!("{:#04X}", crate::packet::quic::LONG_HEADER_FIRST_BYTE_MIN)
-            )
-        );
+        assert!(s.contains(&gate), "missing gate {gate}: {s}");
+        assert!(!s.contains("0xC0"), "fixed bit must not gate capture: {s}");
+        assert_eq!(count(&s, '('), count(&s, ')'), "{s}");
+    }
+
+    #[test]
+    fn both_blocking_policies_use_the_configured_ports() {
+        // Regression: the old blanket-drop filter hard-coded 443 while the
+        // selective path used `tls_ports`, so `--quic all` silently ignored a
+        // configured QUIC port.
+        for policy in [QuicPolicy::Blocked, QuicPolicy::All] {
+            let cfg = EvasionConfig {
+                quic: policy,
+                tls_ports: vec![443, 8443],
+                ..Default::default()
+            };
+            let s = build(&cfg).unwrap().main.into_string().unwrap();
+            for port in [443, 8443] {
+                assert!(
+                    s.contains(&format!("udp.DstPort == {port}")),
+                    "{policy:?} misses UDP {port}: {s}"
+                );
+            }
+        }
     }
 
     #[test]

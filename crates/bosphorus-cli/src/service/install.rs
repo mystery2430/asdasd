@@ -187,45 +187,283 @@ fn default_install_dir() -> PathBuf {
 /// LocalSystem binary or its DLLs.
 fn resolve_exe(opts: &Opts) -> anyhow::Result<PathBuf> {
     let current = std::env::current_exe()?;
-    let dst_dir = opts.install_dir.clone().unwrap_or_else(default_install_dir);
-    ensure_install_dir_is_secure(&dst_dir, directory_is_safe)?;
+    let requested = opts.install_dir.clone().unwrap_or_else(default_install_dir);
+
+    // Only the canonical path is used from here on. It is what the ACL policy
+    // inspected, what receives the copies, and what is registered with the SCM.
+    // Validating a resolved path and then writing through the caller's original
+    // spelling let a reparse point (junction/symlink) or a `..` component point
+    // the copy — and therefore the LocalSystem service binary — somewhere the
+    // check never saw.
+    let dst_dir = prepare_install_dir(&requested, directory_is_safe)?;
     copy_install_files(&current, &dst_dir)?;
-    Ok(dst_dir.join("bosphorus.exe"))
+
+    let exe = dst_dir.join("bosphorus.exe");
+    verify_resolves_inside(&exe, &dst_dir)?;
+    Ok(service_path(&exe))
 }
 
-/// Create the destination and prove it is not writable by ordinary users.
-/// `probe` returns `true` only when the directory's DACL has no broad allow
-/// ACE that grants write/delete rights. Injecting it keeps this decision
-/// unit-testable without installing a service or editing real ACLs.
-fn ensure_install_dir_is_secure(
-    dst_dir: &Path,
-    probe: impl FnOnce(&Path) -> std::io::Result<bool>,
-) -> anyhow::Result<()> {
-    std::fs::create_dir_all(dst_dir)?;
-    let absolute = dst_dir.canonicalize().map_err(|e| {
+/// Windows verbatim-path prefix, as produced by `canonicalize()`.
+const VERBATIM_PREFIX: &str = r"\\?\";
+
+/// The spelling to hand to the Service Control Manager.
+///
+/// `canonicalize()` yields a Windows verbatim path (`\\?\C:\Program
+/// Files\...`), which is correct for file access but unusual in a stored
+/// service `ImagePath`. The plain spelling is used only when it provably
+/// resolves to the same file that was validated; otherwise the verbatim path is
+/// kept, so the registered path can never point somewhere the check did not see.
+fn service_path(validated: &Path) -> PathBuf {
+    let text = validated.to_string_lossy();
+    let Some(plain) = text.strip_prefix(VERBATIM_PREFIX) else {
+        return validated.to_path_buf();
+    };
+    let plain = PathBuf::from(plain);
+    match plain.canonicalize() {
+        Ok(resolved) if resolved == validated => plain,
+        _ => validated.to_path_buf(),
+    }
+}
+
+/// Create the destination, then prove that *this* path is safe to install a
+/// LocalSystem binary into. Returns the canonical path callers must use.
+///
+/// `probe` returns `true` only when a directory is administrator-controlled (see
+/// [`bosphorus_core::service_acl`]). Injecting it keeps the decision testable
+/// without installing a service or editing real ACLs.
+///
+/// Three separate conditions are required:
+///
+/// 1. the directory itself is administrator-controlled, so its contents cannot
+///    be replaced;
+/// 2. its **parent** is too — `FILE_DELETE_CHILD` on the parent lets an ordinary
+///    user delete and recreate this directory (and then control its contents),
+///    no matter how tight the directory's own ACL is;
+/// 3. the path still resolves to the same place after the check, so a reparse
+///    point cannot be swapped in between the probe and the copy.
+///
+/// Finally the directory's ACL is rewritten to an explicit administrator-only
+/// DACL, so a destination that already existed with inherited or altered
+/// permissions cannot keep them.
+fn prepare_install_dir(
+    requested: &Path,
+    probe: impl Fn(&Path) -> std::io::Result<bool>,
+) -> anyhow::Result<PathBuf> {
+    std::fs::create_dir_all(requested)?;
+    let canonical = requested.canonicalize().map_err(|e| {
         anyhow::anyhow!(
             "install directory cannot be resolved: {}: {e}",
-            dst_dir.display()
+            requested.display()
         )
     })?;
-    if !probe(&absolute)? {
+
+    if !probe(&canonical)? {
         anyhow::bail!(
             "refusing to install a LocalSystem service in '{}': the directory is writable by \
              an unprivileged principal. Choose an administrator-controlled path or omit \
              --install-dir to use {}.",
-            absolute.display(),
+            canonical.display(),
             default_install_dir().display()
+        );
+    }
+
+    if let Some(parent) = canonical.parent() {
+        if !probe(parent)? {
+            anyhow::bail!(
+                "refusing to install a LocalSystem service in '{}': its parent '{}' can be \
+                 modified by an unprivileged principal, which is enough to replace the whole \
+                 directory after it has been checked.",
+                canonical.display(),
+                parent.display()
+            );
+        }
+    }
+
+    // The probe above ran on `canonical`. If the path now resolves somewhere
+    // else, a reparse point changed under us and nothing that follows would be
+    // about the directory that was checked.
+    let resolved_again = canonical.canonicalize().map_err(|e| {
+        anyhow::anyhow!(
+            "install directory cannot be re-resolved after validation: {}: {e}",
+            canonical.display()
+        )
+    })?;
+    if resolved_again != canonical {
+        anyhow::bail!(
+            "refusing to install in '{}': the path resolved to '{}' while it was being \
+             validated, so the checked directory is not the one that would receive the files.",
+            canonical.display(),
+            resolved_again.display()
+        );
+    }
+
+    lock_down(&resolved_again)?;
+    Ok(resolved_again)
+}
+
+/// Fail closed unless `path` still resolves directly inside `dir`.
+///
+/// Checked *after* copying, because a destination file could itself be a
+/// pre-existing symlink/hardlink pointing outside the validated directory.
+fn verify_resolves_inside(path: &Path, dir: &Path) -> anyhow::Result<()> {
+    let resolved = path.canonicalize().map_err(|e| {
+        anyhow::anyhow!(
+            "installed service file cannot be resolved: {}: {e}",
+            path.display()
+        )
+    })?;
+    if resolved.parent() != Some(dir) {
+        anyhow::bail!(
+            "refusing to register '{}': it resolves to '{}', outside the validated install \
+             directory '{}'.",
+            path.display(),
+            resolved.display(),
+            dir.display()
         );
     }
     Ok(())
 }
 
+/// Restrict `path` to an explicit administrator-only ACL. Windows-only; a no-op
+/// elsewhere so the surrounding logic stays testable on any host.
+fn lock_down(path: &Path) -> anyhow::Result<()> {
+    apply_admin_only_dacl(path).map_err(|e| {
+        anyhow::anyhow!(
+            "cannot restrict the permissions of '{}': {e}. The service runs as LocalSystem, so \
+             everything it loads must be writable only by administrators.",
+            path.display()
+        )
+    })
+}
+
+/// SDDL for an install location only administrators may modify: a protected DACL
+/// (no inherited ACEs), full control for LocalSystem and Administrators, and
+/// read+execute for Users. Entries are inheritable so copied files stay locked
+/// down.
+#[cfg(windows)]
+const ADMIN_ONLY_SDDL: &str = "D:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)";
+
+/// `SetNamedSecurityInfoW(..., DACL_SECURITY_INFORMATION |
+/// PROTECTED_DACL_SECURITY_INFORMATION)` with [`ADMIN_ONLY_SDDL`].
+///
+/// The owner is deliberately not rewritten: changing an owner needs extra
+/// privileges, and a non-administrator owner is already a hard rejection in
+/// [`prepare_install_dir`].
+#[cfg(windows)]
+fn apply_admin_only_dacl(path: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::HLOCAL;
+    use windows::Win32::Security::Authorization::{
+        ConvertStringSecurityDescriptorToSecurityDescriptorW, SetNamedSecurityInfoW, SE_FILE_OBJECT,
+    };
+    use windows::Win32::Security::{
+        GetSecurityDescriptorDacl, DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
+        PSECURITY_DESCRIPTOR,
+    };
+    use windows::Win32::System::Memory::LocalFree;
+
+    struct Descriptor(PSECURITY_DESCRIPTOR);
+    impl Drop for Descriptor {
+        fn drop(&mut self) {
+            if !self.0 .0.is_null() {
+                // SAFETY: ConvertStringSecurityDescriptorToSecurityDescriptorW
+                // returned this LocalAlloc block.
+                unsafe {
+                    let _ = LocalFree(HLOCAL(self.0 .0 as isize));
+                }
+            }
+        }
+    }
+
+    let sddl: Vec<u16> = ADMIN_ONLY_SDDL
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut sd = PSECURITY_DESCRIPTOR::default();
+    // SAFETY: `sddl` is NUL-terminated and outlives the call; `sd` receives an
+    // owned descriptor freed by `Descriptor`.
+    if !unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            PCWSTR(sddl.as_ptr()),
+            1,
+            &mut sd,
+            None,
+        )
+    }
+    .as_bool()
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    let descriptor = Descriptor(sd);
+
+    // `windows` 0.48 declares these as `*mut i32` (BOOL-compatible), not `BOOL`.
+    let mut present: i32 = 0;
+    let mut dacl: *mut windows::Win32::Security::ACL = std::ptr::null_mut();
+    let mut defaulted: i32 = 0;
+    // SAFETY: `sd` is a valid descriptor; the three out-params are valid.
+    if !unsafe { GetSecurityDescriptorDacl(sd, &mut present, &mut dacl, &mut defaulted) }.as_bool()
+        || present == 0
+        || dacl.is_null()
+    {
+        return Err(std::io::Error::other("SDDL produced no DACL"));
+    }
+
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    // SAFETY: `wide` is NUL-terminated; `dacl` belongs to the live `descriptor`,
+    // which is dropped only after the call returns.
+    let status = unsafe {
+        SetNamedSecurityInfoW(
+            PCWSTR(wide.as_ptr()),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            None,
+            None,
+            Some(dacl),
+            None,
+        )
+    };
+    drop(descriptor);
+    if status.0 != 0 {
+        return Err(std::io::Error::from_raw_os_error(status.0 as i32));
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn apply_admin_only_dacl(_path: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
 const INSTALL_FILES: [&str; 3] = ["bosphorus.exe", "WinDivert.dll", "WinDivert64.sys"];
 
-/// Copy exactly the three files the service will load, and verify each is
-/// present and non-empty. A missing DLL/SYS used to be only a warning, which
-/// produced a registered service that could not start.
+/// Copy exactly the three files the service will load, restrict each to
+/// administrator-only permissions, and verify it is present and non-empty. A
+/// missing DLL/SYS used to be only a warning, which produced a registered service
+/// that could not start.
 fn copy_install_files(current_exe: &Path, dst_dir: &Path) -> anyhow::Result<()> {
+    // Track what this call created so a failure half-way cannot leave a partial
+    // set of LocalSystem files (and, later, a service that cannot start) behind.
+    let mut created: Vec<PathBuf> = Vec::new();
+    let result = copy_install_files_inner(current_exe, dst_dir, &mut created);
+    if result.is_err() {
+        for path in created.iter().rev() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+    result
+}
+
+fn copy_install_files_inner(
+    current_exe: &Path,
+    dst_dir: &Path,
+    created: &mut Vec<PathBuf>,
+) -> anyhow::Result<()> {
     let src_dir = current_exe.parent().unwrap_or_else(|| Path::new("."));
     let sources = [
         ("bosphorus.exe", current_exe.to_path_buf()),
@@ -243,7 +481,17 @@ fn copy_install_files(current_exe: &Path, dst_dir: &Path) -> anyhow::Result<()> 
     }
 
     for (name, source) in &sources {
+        // `dst_dir` is the canonical, validated directory, so this join cannot be
+        // redirected by the caller's spelling of the path.
         let destination = dst_dir.join(name);
+        // A pre-existing destination could itself be a link pointing outside the
+        // validated directory; refuse rather than follow it.
+        if destination.symlink_metadata().is_ok() {
+            verify_resolves_inside(&destination, dst_dir).map_err(|e| {
+                anyhow::anyhow!("refusing to overwrite {name} outside the install directory: {e}")
+            })?;
+        }
+        let existed = destination.symlink_metadata().is_ok();
         let same_file = source.canonicalize().ok() == destination.canonicalize().ok();
         if !same_file {
             std::fs::copy(source, &destination).map_err(|e| {
@@ -253,7 +501,13 @@ fn copy_install_files(current_exe: &Path, dst_dir: &Path) -> anyhow::Result<()> 
                     destination.display()
                 )
             })?;
+            if !existed {
+                created.push(destination.clone());
+            }
         }
+        // `fs::copy` onto an existing file keeps that file's ACL, so a
+        // world-writable leftover would stay world-writable. Re-apply ours.
+        lock_down(&destination)?;
         let meta = std::fs::metadata(&destination)?;
         if !meta.is_file() || meta.len() == 0 {
             anyhow::bail!(
@@ -414,7 +668,11 @@ fn directory_is_safe(path: &Path) -> std::io::Result<bool> {
         } else {
             None
         };
-        entries.push(AceEntry { ace_type, mask, sid });
+        entries.push(AceEntry {
+            ace_type,
+            mask,
+            sid,
+        });
     }
     drop(descriptor);
 
@@ -523,7 +781,7 @@ mod tests {
     #[test]
     fn a_user_writable_directory_is_refused_before_the_service_is_created() {
         let dir = TempDir::new("unsafe");
-        let err = ensure_install_dir_is_secure(&dir.0.join("Bosphorus"), |_| Ok(false))
+        let err = prepare_install_dir(&dir.0.join("Bosphorus"), |_| Ok(false))
             .expect_err("a user-writable directory must be rejected");
         let text = err.to_string();
         assert!(text.contains("refusing to install"), "{text}");
@@ -534,8 +792,160 @@ mod tests {
     fn a_directory_passing_the_acl_probe_is_accepted() {
         let dir = TempDir::new("safe");
         let target = dir.path().join("Bosphorus");
-        ensure_install_dir_is_secure(&target, |_| Ok(true)).expect("safe directory accepted");
+        let accepted = prepare_install_dir(&target, |_| Ok(true)).expect("safe directory");
         assert!(target.is_dir());
+        assert_eq!(accepted, target.canonicalize().unwrap());
+    }
+
+    /// Regression: the ACL probe used to run on `canonicalize()` while the copy
+    /// and the registered `ImagePath` kept the caller's original spelling. Those
+    /// can differ (`..`, relative paths, junctions), so the files could land
+    /// outside the directory that was checked. The validated path must be the
+    /// returned one, and it must be what the probe saw.
+    #[test]
+    fn the_path_that_is_probed_is_the_path_that_is_returned() {
+        let root = TempDir::new("canon");
+        let real = root.path().join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        let requested = real.join("nested").join("..").join("Bosphorus");
+
+        let probed = std::cell::RefCell::new(Vec::new());
+        let canonical = prepare_install_dir(&requested, |p| {
+            probed.borrow_mut().push(p.to_path_buf());
+            Ok(true)
+        })
+        .expect("accepted");
+
+        let canonical = canonical.canonicalize().unwrap();
+        assert!(
+            probed.borrow().contains(&canonical),
+            "probe did not see {canonical:?}"
+        );
+        assert!(!probed
+            .borrow()
+            .iter()
+            .any(|p| p.to_string_lossy().contains("..")));
+        // The copy destination derived from the returned path lands in the
+        // validated directory, not in whatever the caller spelled.
+        let src = TempDir::new("canon-src");
+        let exe = src.path().join("downloaded.exe");
+        std::fs::write(&exe, b"exe").unwrap();
+        std::fs::write(src.path().join("WinDivert.dll"), b"dll").unwrap();
+        std::fs::write(src.path().join("WinDivert64.sys"), b"sys").unwrap();
+        copy_install_files(&exe, &canonical).expect("copy");
+        assert!(canonical.join("bosphorus.exe").is_file());
+    }
+
+    /// A reparse point in the requested path is followed once, and the resolved
+    /// (validated) directory is what gets returned — not the link.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_install_dir_resolves_to_its_target() {
+        let root = TempDir::new("link");
+        let real = root.path().join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        let link = root.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let canonical =
+            prepare_install_dir(&link.join("Bosphorus"), |_| Ok(true)).expect("link ok");
+        assert_eq!(canonical, real.canonicalize().unwrap().join("Bosphorus"));
+    }
+
+    /// `FILE_DELETE_CHILD` on the parent is enough to replace the whole install
+    /// directory after it has been checked, so the parent has to be trusted too.
+    #[test]
+    fn a_directory_whose_parent_is_user_writable_is_refused() {
+        let root = TempDir::new("parent");
+        let target = root.path().join("Bosphorus");
+        let canonical_parent = root.path().canonicalize().unwrap();
+
+        let err = prepare_install_dir(&target, |p| Ok(p != canonical_parent))
+            .expect_err("a user-writable parent must be rejected");
+        let text = err.to_string();
+        assert!(text.contains("parent"), "{text}");
+        assert!(text.contains("refusing to install"), "{text}");
+    }
+
+    /// A registration path that resolves outside the validated directory must be
+    /// refused, because that is where LocalSystem would load code from.
+    #[cfg(unix)]
+    #[test]
+    fn an_exe_that_resolves_outside_the_install_dir_is_refused() {
+        let root = TempDir::new("escape");
+        let dir = root.path().join("install");
+        std::fs::create_dir_all(&dir).unwrap();
+        let elsewhere = root.path().join("elsewhere.exe");
+        std::fs::write(&elsewhere, b"evil").unwrap();
+        let link = dir.join("bosphorus.exe");
+        std::os::unix::fs::symlink(&elsewhere, &link).unwrap();
+
+        let err = verify_resolves_inside(&link, &dir.canonicalize().unwrap())
+            .expect_err("an exe outside the validated directory must be refused");
+        assert!(err.to_string().contains("outside"), "{err}");
+
+        // A plain file in the directory is accepted.
+        std::fs::remove_file(&link).unwrap();
+        std::fs::write(&link, b"exe").unwrap();
+        verify_resolves_inside(&link, &dir.canonicalize().unwrap()).expect("inside is fine");
+    }
+
+    /// `fs::copy` keeps an existing destination's ACL, so the installer must
+    /// re-apply the restrictive ACL and refuse a destination that is a link out
+    /// of the validated directory.
+    #[cfg(unix)]
+    #[test]
+    fn copying_over_a_link_that_points_outside_is_refused() {
+        let src = TempDir::new("link-src");
+        let dst = TempDir::new("link-dst");
+        let exe = src.path().join("downloaded.exe");
+        std::fs::write(&exe, b"exe").unwrap();
+        std::fs::write(src.path().join("WinDivert.dll"), b"dll").unwrap();
+        std::fs::write(src.path().join("WinDivert64.sys"), b"sys").unwrap();
+
+        let outside = TempDir::new("link-outside");
+        let victim = outside.path().join("WinDivert.dll");
+        std::fs::write(&victim, b"original").unwrap();
+        std::os::unix::fs::symlink(&victim, dst.path().join("WinDivert.dll")).unwrap();
+
+        let err = copy_install_files(&exe, dst.path())
+            .expect_err("writing through a link out of the install dir must be refused");
+        assert!(err.to_string().contains("outside"), "{err}");
+        assert_eq!(
+            std::fs::read(&victim).unwrap(),
+            b"original",
+            "the file outside the install directory must be untouched"
+        );
+        assert!(
+            !dst.path().join("bosphorus.exe").exists(),
+            "a failed install must not leave a partial set of service files behind"
+        );
+    }
+
+    /// A wrong prefix constant would silently disable the stripping and leave
+    /// `\\?\C:\...` in the service's ImagePath, so pin its exact text.
+    #[test]
+    fn the_verbatim_prefix_is_exactly_two_backslashes_question_mark_backslash() {
+        assert_eq!(VERBATIM_PREFIX, "\\\\?\\");
+        assert_eq!(VERBATIM_PREFIX.len(), 4);
+        assert!(VERBATIM_PREFIX.starts_with("\\\\"));
+        assert!(VERBATIM_PREFIX.ends_with("?\\"));
+    }
+
+    /// The path registered with the SCM must always resolve to the exact file
+    /// that was validated, whichever spelling is used.
+    #[test]
+    fn the_registered_path_always_resolves_to_the_validated_file() {
+        let dir = TempDir::new("svcpath");
+        let exe = dir.path().join("bosphorus.exe");
+        std::fs::write(&exe, b"exe").unwrap();
+        let canonical = exe.canonicalize().unwrap();
+        let registered = service_path(&canonical);
+        assert_eq!(
+            registered.canonicalize().unwrap(),
+            canonical,
+            "the registered path must resolve to the validated file"
+        );
     }
 
     #[test]

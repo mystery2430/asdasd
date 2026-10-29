@@ -1,5 +1,5 @@
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -83,6 +83,12 @@ pub type NetKeyFn = Arc<dyn Fn() -> (String, String) + Send + Sync>;
 /// `MAX_CAPTURE` bytes. A future transform that wants to mutate in place has to
 /// change this signature, which is the point: the copy cannot quietly disappear
 /// while mutation is reintroduced.
+///
+/// The boundary does **not** roll back engine state. `process` mutates conntrack,
+/// discovery and the flow table before it builds the strategy, so after an unwind
+/// those may describe a half-finished trial. Packet and batch correctness is
+/// guaranteed here; state consistency is not, which is why [`Engine::run_main`]
+/// forwards the packet and then stops instead of carrying on.
 fn guarded_process<F>(
     data: &[u8],
     meta: &CaptureMeta,
@@ -171,10 +177,6 @@ pub struct Engine {
     /// JSON byte count of the last profile write (0 until the first write, or
     /// in a forced / no-profile run). Read by the `bosphorus::mem` digest.
     last_profile_bytes: AtomicUsize,
-    /// Sequence number of the next profile snapshot. Taken *before* a snapshot
-    /// is exported so a slow writer holding an older snapshot cannot land after
-    /// a newer one (see `persist::save_snapshot`).
-    profile_seq: AtomicU64,
 
     // --- live network re-keying (only populated by `with_live_netkey`) ---
     /// `None` = no live re-keying; `maybe_rebind` is then a no-op.
@@ -197,6 +199,32 @@ pub struct Engine {
     /// `--isp`. Held here so a live rebind can re-attach it to the new session's
     /// `Discovery`.
     isp_pool: OnceLock<Arc<crate::profile::IspPool>>,
+
+    /// Test-only: forces an unwind *after* discovery/flow state has been
+    /// mutated, so the fail-closed behaviour of [`Engine::run_main`] can be
+    /// exercised deterministically. Never compiled into a shipped binary.
+    #[cfg(test)]
+    fault_injection: FaultInjection,
+}
+
+/// See [`Engine::fault_injection`].
+#[cfg(test)]
+#[derive(Default)]
+struct FaultInjection {
+    panic_after_assign: AtomicBool,
+}
+
+#[cfg(test)]
+impl FaultInjection {
+    fn arm(&self) {
+        self.panic_after_assign.store(true, Ordering::SeqCst);
+    }
+
+    fn trip_after_assign(&self) {
+        if self.panic_after_assign.swap(false, Ordering::SeqCst) {
+            panic!("injected fault: after discovery assignment");
+        }
+    }
 }
 
 impl Engine {
@@ -219,7 +247,6 @@ impl Engine {
             mem_at: Mutex::new(now),
             evict_at: Mutex::new(now),
             last_profile_bytes: AtomicUsize::new(0),
-            profile_seq: AtomicU64::new(0),
             netkey_provider: None,
             netkey_dirty: AtomicBool::new(false),
             netkey_changed_at: Mutex::new(now),
@@ -227,6 +254,8 @@ impl Engine {
             netkey_fallback: Mutex::new(None),
             last_netkey_poll: Mutex::new(None),
             isp_pool: OnceLock::new(),
+            #[cfg(test)]
+            fault_injection: FaultInjection::default(),
         }
     }
 
@@ -308,12 +337,7 @@ impl Engine {
     }
 
     /// Per-packet decision: feed conntrack, feed/act on discovery, decide.
-    pub fn process(
-        &self,
-        packet: &[u8],
-        meta: &CaptureMeta,
-        out: &mut SendBatch,
-    ) -> Decision {
+    pub fn process(&self, packet: &[u8], meta: &CaptureMeta, out: &mut SendBatch) -> Decision {
         if meta.impostor {
             return Decision::ForwardOriginal; // our own injected packet
         }
@@ -470,6 +494,11 @@ impl Engine {
             st.trial = Some(trial);
         });
 
+        // Discovery and the flow already point at this candidate; a panic from
+        // here on leaves that half-finished trial behind. Test-only hook.
+        #[cfg(test)]
+        self.fault_injection.trip_after_assign();
+
         let Some(strat) = strat else {
             tracing::info!(
                 target: "bosphorus::discovery",
@@ -535,13 +564,17 @@ impl Engine {
         );
     }
 
-    /// Decide a captured UDP datagram. Only reached under
-    /// [`QuicPolicy::Blocked`] — the other policies keep UDP out of the capture
-    /// filter entirely, so this costs nothing when QUIC handling is off.
+    /// Decide a captured UDP datagram. Reached under `blocked` and `all`; `off`
+    /// keeps UDP out of the capture filter entirely, so this costs nothing when
+    /// QUIC handling is disabled.
     ///
     /// Refusing the datagram is the whole mechanism: a client that gets no
     /// answer to its Initials abandons HTTP/3 for the host and reconnects over
     /// TCP, which is the path Bosphorus actually has a learned strategy for.
+    ///
+    /// The packet is only refused after [`crate::packet::quic`] has parsed a
+    /// long header, which is why `all` no longer needs a driver-side drop: a
+    /// filter cannot tell a QUIC Initial from an ordinary large UDP datagram.
     fn decide_quic(
         &self,
         censored: &CensoredIps,
@@ -549,25 +582,43 @@ impl Engine {
         meta: &CaptureMeta,
         now: Instant,
     ) -> Decision {
-        if self.cfg.quic != QuicPolicy::Blocked || !meta.outbound {
+        if self.cfg.quic == QuicPolicy::Off || !meta.outbound {
             return Decision::ForwardOriginal;
         }
         if !view.dst_port().is_some_and(|p| self.cfg.is_tls_port(p)) {
             return Decision::ForwardOriginal;
         }
+        // The driver filter only proves "large UDP datagram starting with a high
+        // byte". Only a parse of the long header can tell a QUIC connection
+        // attempt from ordinary UDP, so nothing is dropped before this point —
+        // including under `--quic all`, where a blanket driver drop used to
+        // discard unrelated UDP/443 traffic with no way to tell it apart.
         if !crate::packet::is_quic_connection_attempt(view.payload()) {
             return Decision::ForwardOriginal;
         }
         let dst = view.dst_ip();
-        if !censored.contains(&dst, now) {
-            return Decision::ForwardOriginal;
+        match self.cfg.quic {
+            QuicPolicy::Off => Decision::ForwardOriginal, // unreachable; checked above
+            QuicPolicy::All => {
+                tracing::debug!(
+                    target: "bosphorus::quic",
+                    server_ip = %dst,
+                    "refused a QUIC connection attempt (policy: all); falling back to TCP"
+                );
+                Decision::DropOriginal
+            }
+            QuicPolicy::Blocked => {
+                if !censored.contains(&dst, now) {
+                    return Decision::ForwardOriginal;
+                }
+                tracing::debug!(
+                    target: "bosphorus::quic",
+                    server_ip = %dst,
+                    "refused a QUIC connection attempt to a censored destination; falling back to TCP"
+                );
+                Decision::DropOriginal
+            }
         }
-        tracing::debug!(
-            target: "bosphorus::quic",
-            server_ip = %dst,
-            "refused a QUIC connection attempt to a censored destination; falling back to TCP"
-        );
-        Decision::DropOriginal
     }
 
     fn feed_discovery(
@@ -615,15 +666,24 @@ impl Engine {
                     self.process(data, meta, batch)
                 });
             if panicked {
-                // Do not inject anything the failing call staged. The original
-                // packet and its metadata have been restored, so forwarding it
-                // is the conservative, traffic-preserving recovery.
+                // Nothing the failing attempt staged may be injected, and the
+                // loop must not keep making decisions on state a half-finished
+                // attempt left behind: `process` has already updated conntrack,
+                // discovery (assigning a candidate) and the flow's trial before
+                // the strategy is built. Forward this one packet unchanged — it
+                // is traffic we diverted, and dropping it would break the flow —
+                // then stop capturing so the caller shuts down and reports.
                 tracing::error!(
                     target: "bosphorus::engine",
                     bytes = captured.data.len(),
                     outbound = meta.outbound,
-                    "panic while processing one packet; discarded partial batch and forwarded the original"
+                    "panic while processing one packet; discarded its partial batch, forwarded the \
+                     packet unchanged, and stopped capture because engine state can no longer be trusted"
                 );
+                sink.inject(captured.data, &meta)?;
+                return Err(CoreError::Panic(
+                    "packet processing panicked; capture stopped",
+                ));
             }
 
             match decision {
@@ -888,7 +948,10 @@ impl Engine {
     /// is what makes the shutdown flush authoritative over a tick-thread write
     /// that was already in flight.
     fn write_profile(&self, discovery: &Discovery, p: &ProfilePaths) {
-        let seq = self.profile_seq.fetch_add(1, Ordering::SeqCst) + 1;
+        // Process-wide sequence, taken before the export: two engines pointed at
+        // one profile directory must not both start at 1, or the second one's
+        // snapshot would look stale and be discarded.
+        let seq = crate::profile::persist::next_snapshot_seq();
         let file = discovery.export(&p.net_key);
         match crate::profile::persist::save_snapshot(&p.dir, &p.net_key, &file, seq) {
             Ok(Some(n)) => {
@@ -1214,14 +1277,14 @@ mod tests {
     #[test]
     fn forced_strategy_gets_fake_plus_two_segments_and_conntrack_state() {
         let engine = Engine::new_with_strategy(EvasionConfig::default(), Strategy::m4_fixed());
-        let mut ch = clienthello_pkt();
-        let mut meta = CaptureMeta {
+        let ch = clienthello_pkt();
+        let meta = CaptureMeta {
             outbound: true,
             ..Default::default()
         };
         let mut out = SendBatch::new();
 
-        let decision = engine.process(&mut ch, &mut meta, &mut out);
+        let decision = engine.process(&ch, &meta, &mut out);
         assert_eq!(decision, Decision::ForwardBatchOnly);
         assert_eq!(out.len(), 3);
 
@@ -1283,10 +1346,10 @@ mod tests {
         let engine = Engine::new(EvasionConfig::default());
 
         // 1) first ClientHello for a fresh target -> Probe control, unchanged.
-        let mut ch = ch_with_sni("updates.discord.com", 40001);
+        let ch = ch_with_sni("updates.discord.com", 40001);
         let mut out = SendBatch::new();
         assert_eq!(
-            engine.process(&mut ch, &mut out_meta(), &mut out),
+            engine.process(&ch, &out_meta(), &mut out),
             Decision::ForwardOriginal
         );
         assert!(out.is_empty());
@@ -1294,18 +1357,14 @@ mod tests {
         assert_eq!(engine.discovery_summary()[0].key, "updates.discord.com");
 
         // 2) DPI RST for that flow -> discovery learns the target is blocked.
-        engine.process(
-            &mut inbound_rst(40001),
-            &mut in_meta(),
-            &mut SendBatch::new(),
-        );
+        engine.process(&inbound_rst(40001), &in_meta(), &mut SendBatch::new());
         assert_eq!(engine.discovery_summary()[0].phase, NetPhase::Discover);
 
         // 3) next ClientHello (new port = new flow) -> a grid candidate is applied.
-        let mut ch2 = ch_with_sni("updates.discord.com", 40002);
+        let ch2 = ch_with_sni("updates.discord.com", 40002);
         let mut out2 = SendBatch::new();
         assert_eq!(
-            engine.process(&mut ch2, &mut out_meta(), &mut out2),
+            engine.process(&ch2, &out_meta(), &mut out2),
             Decision::ForwardBatchOnly
         );
         assert_eq!(out2.len(), 3);
@@ -1318,38 +1377,30 @@ mod tests {
 
         // Probe fails -> Discover.
         engine.process(
-            &mut ch_with_sni("blocked.example", 41000),
-            &mut out_meta(),
+            &ch_with_sni("blocked.example", 41000),
+            &out_meta(),
             &mut SendBatch::new(),
         );
-        engine.process(
-            &mut inbound_rst(41000),
-            &mut in_meta(),
-            &mut SendBatch::new(),
-        );
+        engine.process(&inbound_rst(41000), &in_meta(), &mut SendBatch::new());
         assert_eq!(engine.discovery_summary()[0].phase, NetPhase::Discover);
 
         // Two fresh connections, each: candidate applied, then ServerHello +
         // real app data -> Success (the grace window is short-circuited by the
         // inbound `0x17`).
         for (i, port) in [41001u16, 41002].into_iter().enumerate() {
-            let mut c = ch_with_sni("blocked.example", port);
+            let c = ch_with_sni("blocked.example", port);
             let mut o = SendBatch::new();
             assert_eq!(
-                engine.process(&mut c, &mut out_meta(), &mut o),
+                engine.process(&c, &out_meta(), &mut o),
                 Decision::ForwardBatchOnly,
                 "iteration {i}"
             );
             engine.process(
-                &mut inbound_serverhello(port),
-                &mut in_meta(),
+                &inbound_serverhello(port),
+                &in_meta(),
                 &mut SendBatch::new(),
             );
-            engine.process(
-                &mut inbound_appdata(port),
-                &mut in_meta(),
-                &mut SendBatch::new(),
-            );
+            engine.process(&inbound_appdata(port), &in_meta(), &mut SendBatch::new());
         }
 
         let s = engine.discovery_summary();
@@ -1374,26 +1425,18 @@ mod tests {
         {
             let e = Engine::new(cfg());
             e.process(
-                &mut ch_with_sni("blocked.example", 47001),
-                &mut out_meta(),
+                &ch_with_sni("blocked.example", 47001),
+                &out_meta(),
                 &mut SendBatch::new(),
             );
-            e.process(
-                &mut inbound_rst(47001),
-                &mut in_meta(),
-                &mut SendBatch::new(),
-            ); // -> Discover
+            e.process(&inbound_rst(47001), &in_meta(), &mut SendBatch::new()); // -> Discover
             for port in [47002u16, 47003] {
                 e.process(
-                    &mut ch_with_sni("blocked.example", port),
-                    &mut out_meta(),
+                    &ch_with_sni("blocked.example", port),
+                    &out_meta(),
                     &mut SendBatch::new(),
                 );
-                e.process(
-                    &mut inbound_rst(port),
-                    &mut in_meta(),
-                    &mut SendBatch::new(),
-                );
+                e.process(&inbound_rst(port), &in_meta(), &mut SendBatch::new());
             }
             assert!(e.discovery_summary()[0].tried >= 2);
             e.persist_now();
@@ -1433,14 +1476,14 @@ mod tests {
             tls_pad: None,
         };
         let engine = Engine::new_with_strategy(EvasionConfig::default(), strat);
-        let mut ch = ch_with_sni("updates.discord.com", 46001);
-        let mut meta = CaptureMeta {
+        let ch = ch_with_sni("updates.discord.com", 46001);
+        let meta = CaptureMeta {
             outbound: true,
             ..Default::default()
         };
         let mut out = SendBatch::new();
         assert_eq!(
-            engine.process(&mut ch, &mut meta, &mut out),
+            engine.process(&ch, &meta, &mut out),
             Decision::ForwardBatchOnly
         );
         assert_eq!(out.len(), 4, "3 cut points -> 4 segments, no fake");
@@ -1464,29 +1507,25 @@ mod tests {
 
         // Probe fails -> Discover.
         engine.process(
-            &mut ch_with_sni("updates.discord.com", 45001),
-            &mut out_meta(),
+            &ch_with_sni("updates.discord.com", 45001),
+            &out_meta(),
             &mut SendBatch::new(),
         );
-        engine.process(
-            &mut inbound_rst(45001),
-            &mut in_meta(),
-            &mut SendBatch::new(),
-        );
+        engine.process(&inbound_rst(45001), &in_meta(), &mut SendBatch::new());
         assert_eq!(engine.discovery_summary()[0].phase, NetPhase::Discover);
 
         // Two fresh connections, no verdict in between.
-        let mut a = ch_with_sni("updates.discord.com", 45002);
+        let a = ch_with_sni("updates.discord.com", 45002);
         let mut oa = SendBatch::new();
         assert_eq!(
-            engine.process(&mut a, &mut out_meta(), &mut oa),
+            engine.process(&a, &out_meta(), &mut oa),
             Decision::ForwardBatchOnly
         );
 
-        let mut b = ch_with_sni("updates.discord.com", 45003);
+        let b = ch_with_sni("updates.discord.com", 45003);
         let mut ob = SendBatch::new();
         assert_eq!(
-            engine.process(&mut b, &mut out_meta(), &mut ob),
+            engine.process(&b, &out_meta(), &mut ob),
             Decision::ForwardBatchOnly
         );
 
@@ -1506,15 +1545,11 @@ mod tests {
 
         // Connection A: SNI readable -> target "updates.discord.com", then blocked.
         engine.process(
-            &mut ch_with_sni("updates.discord.com", 42001),
-            &mut out_meta(),
+            &ch_with_sni("updates.discord.com", 42001),
+            &out_meta(),
             &mut SendBatch::new(),
         );
-        engine.process(
-            &mut inbound_rst(42001),
-            &mut in_meta(),
-            &mut SendBatch::new(),
-        );
+        engine.process(&inbound_rst(42001), &in_meta(), &mut SendBatch::new());
         assert_eq!(engine.discovery_summary()[0].phase, NetPhase::Discover);
 
         // Connection B: SAME server, but the captured ClientHello segment has no
@@ -1526,7 +1561,7 @@ mod tests {
         b[2..4].copy_from_slice(&tl.to_be_bytes());
         let mut out = SendBatch::new();
         assert_eq!(
-            engine.process(&mut b, &mut out_meta(), &mut out),
+            engine.process(&b, &out_meta(), &mut out),
             Decision::ForwardOriginal
         );
         assert!(out.is_empty(), "no-SNI ClientHello must not be mutated");
@@ -1540,10 +1575,10 @@ mod tests {
         assert_eq!(s[0].key, "updates.discord.com");
 
         // Connection C: full SNI again -> the same target keeps sweeping.
-        let mut c = ch_with_sni("updates.discord.com", 42003);
+        let c = ch_with_sni("updates.discord.com", 42003);
         let mut oc = SendBatch::new();
         assert_eq!(
-            engine.process(&mut c, &mut out_meta(), &mut oc),
+            engine.process(&c, &out_meta(), &mut oc),
             Decision::ForwardBatchOnly
         );
         assert_eq!(engine.discovery_summary().len(), 1);
@@ -1554,19 +1589,19 @@ mod tests {
         let engine = Engine::new_with_strategy(EvasionConfig::default(), Strategy::m4_fixed());
 
         // *.discord.media voice signalling rides Cloudflare's 2096 - must be mutated.
-        let mut ch = ch_with_sni_dport("c-fra07.discord.media", 48001, 2096);
+        let ch = ch_with_sni_dport("c-fra07.discord.media", 48001, 2096);
         let mut out = SendBatch::new();
         assert_eq!(
-            engine.process(&mut ch, &mut out_meta(), &mut out),
+            engine.process(&ch, &out_meta(), &mut out),
             Decision::ForwardBatchOnly
         );
         assert!(!out.is_empty(), "strategy not applied on port 2096");
 
         // A non-TLS port is left alone.
-        let mut other = ch_with_sni_dport("example.com", 48002, 8080);
+        let other = ch_with_sni_dport("example.com", 48002, 8080);
         let mut o2 = SendBatch::new();
         assert_eq!(
-            engine.process(&mut other, &mut out_meta(), &mut o2),
+            engine.process(&other, &out_meta(), &mut o2),
             Decision::ForwardOriginal
         );
         assert!(o2.is_empty());
@@ -1577,19 +1612,19 @@ mod tests {
         let engine = Engine::new_with_strategy(EvasionConfig::default(), Strategy::m4_fixed());
 
         // First ClientHello -> strategy applied.
-        let mut ch = ch_with_sni("blocked.example", 43001);
+        let ch = ch_with_sni("blocked.example", 43001);
         let mut o1 = SendBatch::new();
         assert_eq!(
-            engine.process(&mut ch, &mut out_meta(), &mut o1),
+            engine.process(&ch, &out_meta(), &mut o1),
             Decision::ForwardBatchOnly
         );
         assert!(!o1.is_empty());
 
         // Same flow, another ClientHello (a retransmit) -> unchanged, no batch.
-        let mut ch2 = ch_with_sni("blocked.example", 43001);
+        let ch2 = ch_with_sni("blocked.example", 43001);
         let mut o2 = SendBatch::new();
         assert_eq!(
-            engine.process(&mut ch2, &mut out_meta(), &mut o2),
+            engine.process(&ch2, &out_meta(), &mut o2),
             Decision::ForwardOriginal
         );
         assert!(o2.is_empty());
@@ -1602,8 +1637,8 @@ mod tests {
         // to `remote_initial_ttl` (which `assign` reads).
         let engine = Engine::new(EvasionConfig::default());
         engine.process(
-            &mut inbound_tcp_ttl(44001, 120, 0x12, &[]),
-            &mut in_meta(),
+            &inbound_tcp_ttl(44001, 120, 0x12, &[]),
+            &in_meta(),
             &mut SendBatch::new(),
         );
         let key = FlowKey {
@@ -1697,18 +1732,14 @@ mod tests {
 
         // keyA session: block a target -> it has discovery + flow state.
         engine.process(
-            &mut ch_with_sni("blocked.example", 51001),
-            &mut out_meta(),
+            &ch_with_sni("blocked.example", 51001),
+            &out_meta(),
             &mut SendBatch::new(),
         );
+        engine.process(&inbound_rst(51001), &in_meta(), &mut SendBatch::new());
         engine.process(
-            &mut inbound_rst(51001),
-            &mut in_meta(),
-            &mut SendBatch::new(),
-        );
-        engine.process(
-            &mut ch_with_sni("blocked.example", 51002),
-            &mut out_meta(),
+            &ch_with_sni("blocked.example", 51002),
+            &out_meta(),
             &mut SendBatch::new(),
         );
         assert!(engine.flows().stats().0 > 0, "flows populated");
@@ -1826,8 +1857,8 @@ mod tests {
         let (engine, _cell) = live_engine(dir.path(), "keyA"); // provider keeps returning keyA
 
         engine.process(
-            &mut ch_with_sni("blocked.example", 52001),
-            &mut out_meta(),
+            &ch_with_sni("blocked.example", 52001),
+            &out_meta(),
             &mut SendBatch::new(),
         );
         let flows_before = engine.flows().stats().0;
@@ -1889,15 +1920,11 @@ mod tests {
         let (engine, cell) = live_engine(dir.path(), "keyA");
 
         engine.process(
-            &mut ch_with_sni("blocked.example", 53001),
-            &mut out_meta(),
+            &ch_with_sni("blocked.example", 53001),
+            &out_meta(),
             &mut SendBatch::new(),
         );
-        engine.process(
-            &mut inbound_rst(53001),
-            &mut in_meta(),
-            &mut SendBatch::new(),
-        );
+        engine.process(&inbound_rst(53001), &in_meta(), &mut SendBatch::new());
 
         // Network lost -> provider returns "nonet".
         *cell.lock() = "nonet".into();
@@ -1911,15 +1938,11 @@ mod tests {
 
         // Learn something on the nonet session, then force writes.
         engine.process(
-            &mut ch_with_sni("other.example", 53002),
-            &mut out_meta(),
+            &ch_with_sni("other.example", 53002),
+            &out_meta(),
             &mut SendBatch::new(),
         );
-        engine.process(
-            &mut inbound_rst(53002),
-            &mut in_meta(),
-            &mut SendBatch::new(),
-        );
+        engine.process(&inbound_rst(53002), &in_meta(), &mut SendBatch::new());
         engine.persist_now();
         engine.tick(t0 + Duration::from_secs(60)); // maybe_persist path too
 
@@ -1947,15 +1970,11 @@ mod tests {
 
         // keyA: block a.example -> Discover.
         engine.process(
-            &mut ch_with_sni("a.example", 60001),
-            &mut out_meta(),
+            &ch_with_sni("a.example", 60001),
+            &out_meta(),
             &mut SendBatch::new(),
         );
-        engine.process(
-            &mut inbound_rst(60001),
-            &mut in_meta(),
-            &mut SendBatch::new(),
-        );
+        engine.process(&inbound_rst(60001), &in_meta(), &mut SendBatch::new());
         assert_eq!(engine.discovery_summary()[0].phase, NetPhase::Discover);
 
         // A -> B (flushes keyA/a.example to its own file).
@@ -1966,15 +1985,11 @@ mod tests {
 
         // keyB: block b.example -> Discover.
         engine.process(
-            &mut ch_with_sni("b.example", 60002),
-            &mut out_meta(),
+            &ch_with_sni("b.example", 60002),
+            &out_meta(),
             &mut SendBatch::new(),
         );
-        engine.process(
-            &mut inbound_rst(60002),
-            &mut in_meta(),
-            &mut SendBatch::new(),
-        );
+        engine.process(&inbound_rst(60002), &in_meta(), &mut SendBatch::new());
         assert_eq!(engine.discovery_summary()[0].phase, NetPhase::Discover);
 
         // B -> A (flushes keyB/b.example; reloads keyA -> a.example from disk).
@@ -2108,6 +2123,108 @@ mod tests {
         );
     }
 
+    /// Regression: the boundary used to forward the packet and carry on. But
+    /// `process` mutates conntrack, discovery and the flow's trial *before* it
+    /// builds the strategy, so an unwind leaves a half-finished trial behind;
+    /// continuing would make later decisions from that state. The loop must now
+    /// forward the one packet it already diverted and stop capture.
+    #[test]
+    fn a_panicking_packet_stops_capture_and_is_forwarded_unchanged() {
+        // A readable SNI is required in discovery mode, so use the same helper
+        // the discovery tests use rather than the bare ClientHello fixture.
+        let first = ch_with_sni("panic.example", 41002);
+        let mut src = VecSource {
+            packets: vec![
+                (first.clone(), true),
+                (ch_with_sni("panic.example", 41003), true),
+            ],
+            idx: 0,
+        };
+        let mut sink = RecSink::default();
+        let engine = Engine::new(EvasionConfig::default());
+        // The fault fires after discovery has assigned a candidate and the flow
+        // records the trial, i.e. after shared state was already mutated.
+        engine.fault_injection.arm();
+
+        let err = engine
+            .run_main(&mut src, &mut sink, &StopFlag::new())
+            .expect_err("a panic must stop the capture loop, not be swallowed");
+
+        assert!(
+            matches!(err, CoreError::Panic(_)),
+            "expected the fail-closed panic error, got {err:?}"
+        );
+        assert_eq!(src.idx, 1, "no packet after the panic may be processed");
+        assert_eq!(sink.recalc_calls, 0, "no staged batch may be emitted");
+        assert_eq!(
+            sink.injected.len(),
+            1,
+            "only the untouched packet is forwarded"
+        );
+        assert_eq!(
+            sink.injected[0], first,
+            "the forwarded packet must be byte-identical to the captured one"
+        );
+    }
+
+    /// Two `Engine`s in one process can be pointed at the same profile store.
+    /// The snapshot sequence must be process-wide, or the second engine's first
+    /// write looks older than the first engine's committed snapshot and is
+    /// silently dropped.
+    #[test]
+    fn two_engines_sharing_a_profile_store_both_persist() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = crate::profile::persist::profile_path(dir.path(), "keyA");
+
+        // Engine A learns a target (a ClientHello plus a reset moves it into the
+        // discovery sweep), then flushes.
+        let (a, _cell_a) = live_engine(dir.path(), "keyA");
+        a.process(
+            &ch_with_sni("blocked.example", 41001),
+            &out_meta(),
+            &mut SendBatch::new(),
+        );
+        a.process(&inbound_rst(41001), &in_meta(), &mut SendBatch::new());
+        a.persist_now();
+        let after_a = crate::profile::persist::load(dir.path(), "keyA").expect("A wrote the store");
+        assert!(
+            !after_a.targets.is_empty(),
+            "engine A must have persisted its target"
+        );
+
+        // Engine B, same process, same store. It restores A's target, learns one
+        // of its own, then flushes. With a per-engine counter B's first write
+        // looks as old as A's already-committed snapshot and is dropped, so B's
+        // newly learned target never reaches disk.
+        let (b, _cell_b) = live_engine(dir.path(), "keyA");
+        b.process(
+            &ch_with_sni("second.example", 41004),
+            &out_meta(),
+            &mut SendBatch::new(),
+        );
+        b.process(&inbound_rst(41004), &in_meta(), &mut SendBatch::new());
+        b.persist_now();
+
+        let after_b =
+            crate::profile::persist::load(dir.path(), "keyA").expect("the store must stay valid");
+        assert!(
+            after_b
+                .targets
+                .iter()
+                .any(|t| t.key.contains("second.example")),
+            "engine B's newer snapshot must win; keys = {:?}",
+            after_b.targets.iter().map(|t| &t.key).collect::<Vec<_>>()
+        );
+        assert!(
+            after_b
+                .targets
+                .iter()
+                .any(|t| t.key.contains("blocked.example")),
+            "engine A's learned state must survive too"
+        );
+        assert!(path.is_file());
+    }
+
     // --- per-packet panic boundary ----------------------------------------
 
     #[test]
@@ -2171,14 +2288,13 @@ mod tests {
 
     #[test]
     fn a_normal_packet_keeps_its_decision_and_batch() {
-        let mut data = clienthello_pkt();
-        let mut meta = out_meta();
+        let data = clienthello_pkt();
+        let meta = out_meta();
         let mut batch = SendBatch::new();
-        let (decision, panicked) =
-            guarded_process(&mut data, &mut meta, &mut batch, |_, _, batch| {
-                batch.push(vec![0xca, 0xfe], out_meta());
-                Decision::ForwardBatchThenOriginal
-            });
+        let (decision, panicked) = guarded_process(&data, &meta, &mut batch, |_, _, batch| {
+            batch.push(vec![0xca, 0xfe], out_meta());
+            Decision::ForwardBatchThenOriginal
+        });
         assert!(!panicked);
         assert_eq!(decision, Decision::ForwardBatchThenOriginal);
         assert_eq!(batch.items.len(), 1, "normal packet staging is unchanged");
@@ -2217,26 +2333,29 @@ mod tests {
     /// The address `ch_with_sni` / `inbound_rst` use.
     const BLOCKED_DST: [u8; 4] = [93, 184, 216, 34];
 
+    /// `quic_out` with a caller-chosen destination port.
+    fn quic_out_with_port(dst: [u8; 4], dport: u16, payload: &[u8]) -> Vec<u8> {
+        let mut p = quic_out(dst, payload);
+        p[22..24].copy_from_slice(&dport.to_be_bytes());
+        p
+    }
+
     /// Drive a target to a `DpiReset` verdict, which is what marks its address.
     fn provoke_dpi_reset(engine: &Engine, host: &str, sport: u16) {
         engine.process(
-            &mut ch_with_sni(host, sport),
-            &mut out_meta(),
+            &ch_with_sni(host, sport),
+            &out_meta(),
             &mut SendBatch::new(),
         );
-        engine.process(
-            &mut inbound_rst(sport),
-            &mut in_meta(),
-            &mut SendBatch::new(),
-        );
+        engine.process(&inbound_rst(sport), &in_meta(), &mut SendBatch::new());
     }
 
     #[test]
     fn quic_to_a_destination_no_censor_touched_is_left_alone() {
         let engine = Engine::new(EvasionConfig::default());
-        let mut p = quic_out(BLOCKED_DST, &quic_initial());
+        let p = quic_out(BLOCKED_DST, &quic_initial());
         assert_eq!(
-            engine.process(&mut p, &mut out_meta(), &mut SendBatch::new()),
+            engine.process(&p, &out_meta(), &mut SendBatch::new()),
             Decision::ForwardOriginal
         );
     }
@@ -2246,9 +2365,9 @@ mod tests {
         let engine = Engine::new(EvasionConfig::default());
         provoke_dpi_reset(&engine, "blocked.example", 40100);
 
-        let mut p = quic_out(BLOCKED_DST, &quic_initial());
+        let p = quic_out(BLOCKED_DST, &quic_initial());
         assert_eq!(
-            engine.process(&mut p, &mut out_meta(), &mut SendBatch::new()),
+            engine.process(&p, &out_meta(), &mut SendBatch::new()),
             Decision::DropOriginal,
             "the browser has to fall back to TCP for the learned strategy to apply"
         );
@@ -2263,9 +2382,9 @@ mod tests {
         let mut v2 = quic_initial();
         v2[0] = 0xD0;
         v2[1..5].copy_from_slice(&crate::packet::quic::VERSION_2.to_be_bytes());
-        let mut v2_packet = quic_out(BLOCKED_DST, &v2);
+        let v2_packet = quic_out(BLOCKED_DST, &v2);
         assert_eq!(
-            engine.process(&mut v2_packet, &mut out_meta(), &mut SendBatch::new()),
+            engine.process(&v2_packet, &out_meta(), &mut SendBatch::new()),
             Decision::DropOriginal,
             "QUIC v2 must fall back to TCP like v1"
         );
@@ -2274,9 +2393,9 @@ mod tests {
         // padded long header as a connection attempt rather than letting it by.
         let mut unknown = quic_initial();
         unknown[1..5].copy_from_slice(&0xff00_001du32.to_be_bytes());
-        let mut unknown_packet = quic_out(BLOCKED_DST, &unknown);
+        let unknown_packet = quic_out(BLOCKED_DST, &unknown);
         assert_eq!(
-            engine.process(&mut unknown_packet, &mut out_meta(), &mut SendBatch::new()),
+            engine.process(&unknown_packet, &out_meta(), &mut SendBatch::new()),
             Decision::DropOriginal,
             "unknown QUIC versions must not bypass the policy"
         );
@@ -2287,9 +2406,9 @@ mod tests {
         let engine = Engine::new(EvasionConfig::default());
         provoke_dpi_reset(&engine, "blocked.example", 40101);
 
-        let mut elsewhere = quic_out([1, 1, 1, 1], &quic_initial());
+        let elsewhere = quic_out([1, 1, 1, 1], &quic_initial());
         assert_eq!(
-            engine.process(&mut elsewhere, &mut out_meta(), &mut SendBatch::new()),
+            engine.process(&elsewhere, &out_meta(), &mut SendBatch::new()),
             Decision::ForwardOriginal
         );
     }
@@ -2301,20 +2420,20 @@ mod tests {
 
         // A short header — a connection that is already up, which dropping
         // would break outright rather than pushing towards TCP.
-        let mut short_header = quic_out(BLOCKED_DST, &[0x40, 0xab, 0xcd]);
+        let short_header = quic_out(BLOCKED_DST, &[0x40, 0xab, 0xcd]);
         assert_eq!(
-            engine.process(&mut short_header, &mut out_meta(), &mut SendBatch::new()),
+            engine.process(&short_header, &out_meta(), &mut SendBatch::new()),
             Decision::ForwardOriginal
         );
 
         // Likewise a Handshake packet, which only exists mid-negotiation.
-        let mut handshake = quic_out(BLOCKED_DST, &{
+        let handshake = quic_out(BLOCKED_DST, &{
             let mut h = quic_initial();
             h[0] = 0xE0;
             h
         });
         assert_eq!(
-            engine.process(&mut handshake, &mut out_meta(), &mut SendBatch::new()),
+            engine.process(&handshake, &out_meta(), &mut SendBatch::new()),
             Decision::ForwardOriginal
         );
     }
@@ -2328,29 +2447,130 @@ mod tests {
         let engine = Engine::new(cfg);
         provoke_dpi_reset(&engine, "blocked.example", 40103);
 
-        let mut p = quic_out(BLOCKED_DST, &quic_initial());
+        let p = quic_out(BLOCKED_DST, &quic_initial());
         assert_eq!(
-            engine.process(&mut p, &mut out_meta(), &mut SendBatch::new()),
+            engine.process(&p, &out_meta(), &mut SendBatch::new()),
             Decision::ForwardOriginal
         );
     }
 
+    /// `--quic all` classifies in the engine now. It must refuse a connection
+    /// attempt to *any* destination (no learning needed), and it must refuse it
+    /// on the strength of the parsed long header — not on the coarse driver
+    /// filter, which used to drop ordinary large UDP/443 datagrams.
     #[test]
-    fn the_all_policy_drops_in_the_driver_so_the_engine_stays_out_of_it() {
-        // `QuicPolicy::All` keeps UDP out of the capture filter entirely, so a
-        // datagram reaching `process` at all would be a bug in the wiring; the
-        // engine must not second-guess it either way.
+    fn the_all_policy_refuses_connection_attempts_without_learning() {
         let cfg = EvasionConfig {
             quic: QuicPolicy::All,
             ..Default::default()
         };
         let engine = Engine::new(cfg);
-        provoke_dpi_reset(&engine, "blocked.example", 40104);
 
-        let mut p = quic_out(BLOCKED_DST, &quic_initial());
+        // v1 Initial, never touched by any censor signal.
+        let v1 = quic_out([1, 1, 1, 1], &quic_initial());
         assert_eq!(
-            engine.process(&mut p, &mut out_meta(), &mut SendBatch::new()),
+            engine.process(&v1, &out_meta(), &mut SendBatch::new()),
+            Decision::DropOriginal
+        );
+
+        // v2 Initial and a draft/unknown version count too.
+        let mut v2_payload = quic_initial();
+        v2_payload[0] = 0xD0; // v2 Initial type bits
+        v2_payload[1..5].copy_from_slice(&crate::packet::quic::VERSION_2.to_be_bytes());
+        let v2 = quic_out([1, 1, 1, 1], &v2_payload);
+        assert_eq!(
+            engine.process(&v2, &out_meta(), &mut SendBatch::new()),
+            Decision::DropOriginal
+        );
+        let mut draft_payload = quic_initial();
+        draft_payload[1..5].copy_from_slice(&0xff00_001du32.to_be_bytes());
+        let draft = quic_out([1, 1, 1, 1], &draft_payload);
+        assert_eq!(
+            engine.process(&draft, &out_meta(), &mut SendBatch::new()),
+            Decision::DropOriginal
+        );
+
+        // A greased fixed bit is still an Initial (RFC 9287).
+        let mut greased_payload = quic_initial();
+        greased_payload[0] = 0x80;
+        let greased = quic_out([1, 1, 1, 1], &greased_payload);
+        assert_eq!(
+            engine.process(&greased, &out_meta(), &mut SendBatch::new()),
+            Decision::DropOriginal
+        );
+    }
+
+    /// The false-positive cases the old blanket driver drop could not tell
+    /// apart: all of these pass the coarse capture filter (≥1200-byte outbound
+    /// UDP/443 with a high first byte) but must be forwarded, because they are
+    /// not QUIC connection attempts.
+    #[test]
+    fn the_all_policy_forwards_lookalikes_that_are_not_connection_attempts() {
+        let cfg = EvasionConfig {
+            quic: QuicPolicy::All,
+            ..Default::default()
+        };
+        let engine = Engine::new(cfg);
+
+        // Short header: an established QUIC flow, not an attempt.
+        let short = quic_out([1, 1, 1, 1], &[0x40, 0xab, 0xcd, 0xef]);
+        assert_eq!(
+            engine.process(&short, &out_meta(), &mut SendBatch::new()),
+            Decision::ForwardOriginal,
+            "short-header QUIC must keep flowing"
+        );
+
+        // Large ordinary UDP starting with a byte ≥ 0x80 whose "version"/CID
+        // lengths do not parse as a long header.
+        let mut junk = vec![0xC0, 0xde, 0xad, 0xbe, 0xef, 0xff]; // DCID len 255
+        junk.resize(1200, 0);
+        let junk_pkt = quic_out([1, 1, 1, 1], &junk);
+        assert_eq!(
+            engine.process(&junk_pkt, &out_meta(), &mut SendBatch::new()),
+            Decision::ForwardOriginal,
+            "an unparseable datagram is not a QUIC connection attempt"
+        );
+
+        // Version negotiation is server-sent even when it appears outbound.
+        let mut vn_payload = quic_initial();
+        vn_payload[1..5].copy_from_slice(&0u32.to_be_bytes());
+        let vn = quic_out([1, 1, 1, 1], &vn_payload);
+        assert_eq!(
+            engine.process(&vn, &out_meta(), &mut SendBatch::new()),
             Decision::ForwardOriginal
+        );
+
+        // Truncated long header (version cut off).
+        let truncated = quic_out([1, 1, 1, 1], &[0xC0, 0x00, 0x00]);
+        assert_eq!(
+            engine.process(&truncated, &out_meta(), &mut SendBatch::new()),
+            Decision::ForwardOriginal
+        );
+    }
+
+    /// `all` must respect the configured port set instead of hard-coding 443,
+    /// which is what the old driver-side drop filter did.
+    #[test]
+    fn the_all_policy_only_acts_on_configured_quic_ports() {
+        let cfg = EvasionConfig {
+            quic: QuicPolicy::All,
+            tls_ports: vec![443, 8443],
+            ..Default::default()
+        };
+        let engine = Engine::new(cfg);
+
+        let on_8443 = quic_out_with_port([1, 1, 1, 1], 8443, &quic_initial());
+        assert_eq!(
+            engine.process(&on_8443, &out_meta(), &mut SendBatch::new()),
+            Decision::DropOriginal,
+            "a configured QUIC port must be covered"
+        );
+
+        let on_9443 = quic_out_with_port([1, 1, 1, 1], 9443, &quic_initial());
+        assert_eq!(
+            engine.process(&on_9443, &out_meta(), &mut SendBatch::new()),
+            Decision::ForwardOriginal,
+            "an unconfigured port must not be touched"
         );
     }
 
@@ -2359,9 +2579,9 @@ mod tests {
         let engine = Engine::new(EvasionConfig::default());
         provoke_dpi_reset(&engine, "blocked.example", 40105);
 
-        let mut p = quic_out(BLOCKED_DST, &quic_initial());
+        let p = quic_out(BLOCKED_DST, &quic_initial());
         assert_eq!(
-            engine.process(&mut p, &mut in_meta(), &mut SendBatch::new()),
+            engine.process(&p, &in_meta(), &mut SendBatch::new()),
             Decision::ForwardOriginal
         );
     }
@@ -2373,15 +2593,15 @@ mod tests {
         let engine = Engine::new(EvasionConfig::default());
         let t0 = Instant::now();
         engine.process(
-            &mut ch_with_sni("quiet.example", 40106),
-            &mut out_meta(),
+            &ch_with_sni("quiet.example", 40106),
+            &out_meta(),
             &mut SendBatch::new(),
         );
         engine.tick(t0 + Duration::from_secs(30)); // verdict timeout -> Blackhole
 
-        let mut p = quic_out(BLOCKED_DST, &quic_initial());
+        let p = quic_out(BLOCKED_DST, &quic_initial());
         assert_eq!(
-            engine.process(&mut p, &mut out_meta(), &mut SendBatch::new()),
+            engine.process(&p, &out_meta(), &mut SendBatch::new()),
             Decision::ForwardOriginal
         );
     }
@@ -2407,9 +2627,9 @@ mod tests {
         );
 
         provoke_dpi_reset(&engine, "blocked.example", 40107);
-        let mut p = quic_out(BLOCKED_DST, &quic_initial());
+        let p = quic_out(BLOCKED_DST, &quic_initial());
         assert_eq!(
-            engine.process(&mut p, &mut out_meta(), &mut SendBatch::new()),
+            engine.process(&p, &out_meta(), &mut SendBatch::new()),
             Decision::DropOriginal
         );
 
@@ -2417,9 +2637,9 @@ mod tests {
         engine.mark_netkey_dirty();
         engine.tick(Instant::now() + Duration::from_secs(10));
 
-        let mut p = quic_out(BLOCKED_DST, &quic_initial());
+        let p = quic_out(BLOCKED_DST, &quic_initial());
         assert_eq!(
-            engine.process(&mut p, &mut out_meta(), &mut SendBatch::new()),
+            engine.process(&p, &out_meta(), &mut SendBatch::new()),
             Decision::ForwardOriginal,
             "interference is a property of the network that was left behind"
         );

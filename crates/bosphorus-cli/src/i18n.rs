@@ -268,13 +268,6 @@ pub fn err_windivert_open(e: &str, hint: &str) -> String {
     }
 }
 
-pub fn err_quic_block_open(e: &str) -> String {
-    match get() {
-        Lang::En => format!("could not open the QUIC-block handle: {e}"),
-        Lang::Tr => format!("QUIC engelleme tutacağı açılamadı: {e}"),
-    }
-}
-
 pub fn engine_finished(packets: u64, kb: u64, dropped: u64, batches: u64) -> String {
     match get() {
         Lang::En => {

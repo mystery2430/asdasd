@@ -135,6 +135,21 @@ fn unique_tag() -> String {
 /// disk are always those of the newest snapshot this process produced.
 static LAST_COMMITTED: Mutex<Vec<(PathBuf, u64)>> = Mutex::new(Vec::new());
 
+/// Process-wide snapshot counter. Export age must be ordered across *every*
+/// writer in the process, not per [`Engine`](crate::Engine): two engines pointed
+/// at one profile directory would otherwise both start at 1 and the second one's
+/// snapshot would look stale against the first one's already-committed sequence
+/// and be dropped.
+static NEXT_SNAPSHOT_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Take the next snapshot sequence number.
+///
+/// Call this **before** exporting the snapshot it describes: the value records
+/// how old the contents are, not when the write happened.
+pub fn next_snapshot_seq() -> u64 {
+    NEXT_SNAPSHOT_SEQ.fetch_add(1, Ordering::SeqCst) + 1
+}
+
 /// Write `bytes` to `path` atomically: a unique staging file, then a
 /// last-writer-wins rename. The target is never left torn, concurrent writers in
 /// one process cannot share a temp, and a failed write removes its staging file.
@@ -193,7 +208,10 @@ pub fn save_snapshot(
     }
     let json = serde_json::to_vec_pretty(file).map_err(io::Error::other)?;
     stage_and_rename(&path, &json, &unique_tag())?;
-    match committed.iter_mut().find(|(seen_path, _)| seen_path == &path) {
+    match committed
+        .iter_mut()
+        .find(|(seen_path, _)| seen_path == &path)
+    {
         Some(entry) => entry.1 = seq,
         None => committed.push((path, seq)),
     }
@@ -471,10 +489,61 @@ mod tests {
 
         let mut second = sample();
         second.targets[0].key = "second.example".into();
-        assert!(save_snapshot(dir.path(), key, &second, 5).unwrap().is_none());
+        assert!(save_snapshot(dir.path(), key, &second, 5)
+            .unwrap()
+            .is_none());
         assert_eq!(
             load(dir.path(), key).unwrap().targets[0].key,
             "first.example"
         );
+    }
+
+    #[test]
+    fn the_snapshot_sequence_is_process_wide() {
+        // Regression: the counter used to live on `Engine`. A second engine in the
+        // same process targeting the same profile path started again at 1, so its
+        // first write looked older than the first engine's committed snapshot and
+        // was silently discarded (its learned state never reached disk).
+        let dir = tempfile::tempdir().unwrap();
+        let key = "shared";
+
+        let mut older = sample();
+        older.targets[0].key = "engine-a.example".into();
+        let seq_a = next_snapshot_seq();
+        assert!(save_snapshot(dir.path(), key, &older, seq_a)
+            .unwrap()
+            .is_some());
+
+        let mut newer = sample();
+        newer.targets[0].key = "engine-b.example".into();
+        let seq_b = next_snapshot_seq();
+        assert!(seq_b > seq_a, "the counter must not restart per writer");
+        assert!(
+            save_snapshot(dir.path(), key, &newer, seq_b)
+                .unwrap()
+                .is_some(),
+            "the newer writer's snapshot must be committed"
+        );
+
+        assert_eq!(
+            load(dir.path(), key).unwrap().targets[0].key,
+            "engine-b.example"
+        );
+
+        // The mechanism the regression caught: a counter that restarts per
+        // writer hands out a sequence that is not newer than what is already
+        // committed, and the guard then throws the *newer* state away.
+        let mut restarted = sample();
+        restarted.targets[0].key = "engine-b-again.example".into();
+        assert!(
+            save_snapshot(dir.path(), key, &restarted, 1).unwrap().is_none(),
+            "a restarted counter must be rejected, not silently overwrite newer state"
+        );
+        assert_eq!(
+            load(dir.path(), key).unwrap().targets[0].key,
+            "engine-b.example",
+            "the guard kept the newest snapshot"
+        );
+        assert!(tmp_files(dir.path()).is_empty());
     }
 }

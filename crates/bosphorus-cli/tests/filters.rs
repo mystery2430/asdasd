@@ -25,10 +25,6 @@ fn every_quic_policy_produces_filters_windivert_accepts() {
         let f = filter::build(&cfg).expect("build");
         compile_filter(&f.main, Layer::Network)
             .unwrap_or_else(|e| panic!("main filter for {policy:?} rejected: {e:?}"));
-        if let Some(q) = &f.quic_drop {
-            compile_filter(q, Layer::Network)
-                .unwrap_or_else(|e| panic!("quic-drop filter for {policy:?} rejected: {e:?}"));
-        }
     }
 }
 
@@ -56,8 +52,8 @@ fn the_selective_quic_clause_is_present_and_version_agnostic() {
         "the greasable fixed bit must not gate capture: {s}"
     );
     assert!(
-        f.quic_drop.is_none(),
-        "selective mode must not also blanket-drop"
+        !s.contains("udp.SrcPort") || !s.contains("0xC0"),
+        "sanity: the QUIC clause is a capture, not a drop rule"
     );
 }
 

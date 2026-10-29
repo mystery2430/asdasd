@@ -73,4 +73,53 @@ foreach ($needle in @("Write-Host PWNED", "1.2.3'", "1.2.3 | whoami", '$(Write-H
     }
 }
 
+# The scripts that make the workflow safe must actually be called by it. A guard
+# that exists but is never invoked proves nothing.
+foreach ($needle in @(
+    "scripts/apply-release-versions.ps1 -SelfTest",
+    "scripts/test-manual-workflow.ps1",
+    "scripts/apply-release-versions.ps1",
+    "scripts/resolve-release-versions.ps1"
+)) {
+    if ($build -notmatch [regex]::Escape($needle)) {
+        throw "build job never invokes '$needle'"
+    }
+}
+if ($release -notmatch [regex]::Escape("scripts/apply-release-versions.ps1")) {
+    throw "release job does not re-apply the validated versions"
+}
+
+# The artifact the build job uploads must be the one the release job downloads,
+# or a release would publish nothing (or someone else's build).
+$uploadName = $null
+$downloadName = $null
+for ($i = 0; $i -lt $lines.Count; $i++) {
+    if ($lines[$i] -match 'actions/upload-artifact@') {
+        for ($j = $i + 1; $j -lt [Math]::Min($i + 8, $lines.Count); $j++) {
+            if ($lines[$j] -match '^\s+name:\s*(.+)$') { $uploadName = $Matches[1].Trim(); break }
+        }
+    }
+    if ($lines[$i] -match 'actions/download-artifact@') {
+        for ($j = $i + 1; $j -lt [Math]::Min($i + 8, $lines.Count); $j++) {
+            if ($lines[$j] -match '^\s+name:\s*(.+)$') { $downloadName = $Matches[1].Trim(); break }
+        }
+    }
+}
+if (-not $uploadName) { throw "no uploaded artifact found" }
+if ($uploadName -ne $downloadName) {
+    throw "release downloads '$downloadName' but build uploads '$uploadName'"
+}
+if ($uploadName -match '\$\{\{\s*inputs\.') {
+    throw "artifact name interpolates an input; it must come from the resolved env values"
+}
+
+# The PR workflow has to run these guards, otherwise a broken manual-build
+# workflow would only be noticed at release time.
+$prWorkflow = Get-Content ".github/workflows/build.yml" -Raw
+foreach ($needle in @("apply-release-versions.ps1", "test-manual-workflow.ps1")) {
+    if (-not $prWorkflow.Contains($needle)) {
+        throw "build.yml (PR CI) does not run $needle"
+    }
+}
+
 Write-Host "manual workflow safety checks: OK"

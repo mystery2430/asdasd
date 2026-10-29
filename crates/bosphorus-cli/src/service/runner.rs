@@ -148,20 +148,6 @@ fn run_service(arguments: Vec<OsString>) -> anyhow::Result<()> {
         };
     let _ = hslot.set(Arc::clone(&handle));
 
-    // `--quic all` only. A failure here is not fatal: the TCP bypass is the
-    // service's actual job, and it should not refuse to run because the
-    // secondary blanket-block handle could not be opened.
-    let _quic_block = match crate::engine_cmd::open_quic_block(&filters) {
-        Ok(h) => h,
-        Err(e) => {
-            eventlog::error(
-                eventlog::ID_OPEN_FAILED,
-                &format!("{e}; continuing without it"),
-            );
-            None
-        }
-    };
-
     let provider: NetKeyFn = Arc::new(crate::netkey::compute);
     let engine = Arc::new(Engine::with_live_netkey(cfg, provider));
     eventlog::info(

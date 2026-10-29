@@ -314,19 +314,15 @@ pub fn discovery_demo(fresh: bool) -> anyhow::Result<()> {
             );
             // Advance the sweep by exactly one failed candidate.
             let before = t.tried;
-            let mut ch = demo_client_hello("demo.blocked.test", 50100 + before as u16);
+            let ch = demo_client_hello("demo.blocked.test", 50100 + before as u16);
             let mut out = bosphorus_core::SendBatch::new();
-            let d = engine.process(&mut ch, &mut out_meta(), &mut out);
+            let d = engine.process(&ch, &out_meta(), &mut out);
             println!(
                 "[A] ClientHello -> {d:?}  parts={}  (bir aday daha uygulandi)",
                 out.len()
             );
-            let mut rst = demo_rst(50100 + before as u16);
-            engine.process(
-                &mut rst,
-                &mut in_meta(),
-                &mut bosphorus_core::SendBatch::new(),
-            );
+            let rst = demo_rst(50100 + before as u16);
+            engine.process(&rst, &in_meta(), &mut bosphorus_core::SendBatch::new());
             let after = engine
                 .discovery_summary()
                 .into_iter()
@@ -339,26 +335,22 @@ pub fn discovery_demo(fresh: bool) -> anyhow::Result<()> {
         None => {
             println!("demo.blocked.test not on disk — bootstrapping\n");
 
-            let mut ch1 = demo_client_hello("demo.blocked.test", 50001);
+            let ch1 = demo_client_hello("demo.blocked.test", 50001);
             let mut out = bosphorus_core::SendBatch::new();
-            let d1 = engine.process(&mut ch1, &mut out_meta(), &mut out);
+            let d1 = engine.process(&ch1, &out_meta(), &mut out);
             println!("[1] ClientHello       -> {d1:?}   (beklenen: ForwardOriginal, Probe)");
 
-            let mut rst = demo_rst(50001);
-            engine.process(
-                &mut rst,
-                &mut in_meta(),
-                &mut bosphorus_core::SendBatch::new(),
-            );
+            let rst = demo_rst(50001);
+            engine.process(&rst, &in_meta(), &mut bosphorus_core::SendBatch::new());
             println!("[2] inbound RST       -> discovery: Blocked bekleniyor");
 
             // Two concurrent ClientHellos, no verdict between -> D3 parallel sweep.
-            let mut ch2 = demo_client_hello("demo.blocked.test", 50002);
+            let ch2 = demo_client_hello("demo.blocked.test", 50002);
             let mut out_a = bosphorus_core::SendBatch::new();
-            let d3a = engine.process(&mut ch2, &mut out_meta(), &mut out_a);
-            let mut ch3 = demo_client_hello("demo.blocked.test", 50003);
+            let d3a = engine.process(&ch2, &out_meta(), &mut out_a);
+            let ch3 = demo_client_hello("demo.blocked.test", 50003);
             let mut out_b = bosphorus_core::SendBatch::new();
-            let d3b = engine.process(&mut ch3, &mut out_meta(), &mut out_b);
+            let d3b = engine.process(&ch3, &out_meta(), &mut out_b);
 
             let bytes_a: Vec<Vec<u8>> = out_a.items.iter().map(|i| i.bytes.clone()).collect();
             let bytes_b: Vec<Vec<u8>> = out_b.items.iter().map(|i| i.bytes.clone()).collect();
@@ -383,12 +375,8 @@ pub fn discovery_demo(fresh: bool) -> anyhow::Result<()> {
                 "M7d: concurrent connections must sweep different candidates"
             );
 
-            let mut rst2 = demo_rst(50002);
-            engine.process(
-                &mut rst2,
-                &mut in_meta(),
-                &mut bosphorus_core::SendBatch::new(),
-            );
+            let rst2 = demo_rst(50002);
+            engine.process(&rst2, &in_meta(), &mut bosphorus_core::SendBatch::new());
             println!("[4]  inbound RST :50002 -> discovery: NextCandidate\n");
         }
     }
@@ -514,15 +502,6 @@ pub fn check_filters() -> anyhow::Result<()> {
                 println!("  -> REJECTED at pos {}: {}", e.pos, e.msg);
             }
         }
-        if let Some(q) = &f.quic_drop {
-            match compile_filter(q, Layer::Network) {
-                Ok(()) => println!("  quic-drop -> OK"),
-                Err(e) => {
-                    any_err = true;
-                    println!("  quic-drop -> REJECTED at pos {}: {}", e.pos, e.msg);
-                }
-            }
-        }
         println!();
     }
 
@@ -540,20 +519,6 @@ fn init_tracing() {
         .with_env_filter(filter)
         .with_target(true)
         .try_init();
-}
-
-/// Open the blanket QUIC-block handle, if this run's policy asked for one.
-///
-/// `WINDIVERT_FLAG_DROP` means the driver discards every match without queueing
-/// it, so nothing is ever received from this handle — keeping it alive *is* the
-/// block. Shared by `--engine` and the service.
-pub fn open_quic_block(filters: &filter::Filters) -> anyhow::Result<Option<WinDivertHandle>> {
-    let Some(f) = filters.quic_drop.as_ref() else {
-        return Ok(None);
-    };
-    let h = WinDivertHandle::open(f.as_c_str(), Layer::Network, 0, OpenFlags::new().drop())
-        .map_err(|e| anyhow::anyhow!("{}", crate::i18n::err_quic_block_open(&e.to_string())))?;
-    Ok(Some(h))
 }
 
 /// The one-line summary of what this run does about HTTP/3.
@@ -695,11 +660,6 @@ pub fn run_engine(opts: EngineOpts) -> anyhow::Result<()> {
     // by the queue filling faster than our recv loop drains it.
     let _ = h.set_param(Param::QueueLength, 16_384);
     let _ = h.set_param(Param::QueueTime, 8_000);
-
-    // `QuicPolicy::All` only: a second handle whose matches the driver discards
-    // outright, so the blanket block costs nothing per packet. Held for the run;
-    // the selective policy needs no handle because its packets arrive on `h`.
-    let _quic_block = open_quic_block(&filters)?;
 
     let (maj, min) = h.version().unwrap_or((0, 0));
     println!("WinDivert {maj}.{min}");

@@ -149,19 +149,23 @@ pub enum QuicPolicy {
     Blocked,
     /// Refuse every QUIC connection attempt, the way GoodbyeDPI's passive block
     /// does. Costs HTTP/3 across the machine; needs no learning to work.
+    ///
+    /// Unlike GoodbyeDPI this is *not* a driver-side blanket drop: the datagram
+    /// has to be classified first, or an ordinary large UDP/443 payload whose
+    /// first byte happens to be ≥ 0x80 would silently disappear. The driver
+    /// capture filter is only a coarse pre-filter; [`crate::Engine::process`]
+    /// parses the long header and drops only real connection attempts.
     All,
 }
 
 impl QuicPolicy {
-    /// Whether the blanket `WINDIVERT_FLAG_DROP` handle should be opened.
-    pub fn wants_blanket_drop(self) -> bool {
-        matches!(self, QuicPolicy::All)
-    }
-
-    /// Whether QUIC datagrams must reach [`crate::Engine::process`] for a
-    /// per-destination decision.
-    pub fn wants_selective_capture(self) -> bool {
-        matches!(self, QuicPolicy::Blocked)
+    /// Whether QUIC datagrams must reach [`crate::Engine::process`] at all.
+    ///
+    /// Both blocking modes need the packet: `Blocked` decides per destination,
+    /// and `All` still needs the parser to tell a QUIC Initial from an ordinary
+    /// UDP datagram that merely looks like one.
+    pub fn wants_capture(self) -> bool {
+        !matches!(self, QuicPolicy::Off)
     }
 
     /// The spelling accepted on the command line and written into the service's
@@ -325,10 +329,12 @@ mod tests {
     }
 
     #[test]
-    fn the_default_policy_captures_rather_than_blanket_dropping() {
-        let p = QuicPolicy::default();
-        assert_eq!(p, QuicPolicy::Blocked);
-        assert!(p.wants_selective_capture());
-        assert!(!p.wants_blanket_drop());
+    fn every_blocking_policy_captures_and_off_captures_nothing() {
+        // Both `blocked` and `all` need the datagram so the parser, not the
+        // driver filter, decides whether it really is a QUIC connection attempt.
+        assert_eq!(QuicPolicy::default(), QuicPolicy::Blocked);
+        assert!(QuicPolicy::Blocked.wants_capture());
+        assert!(QuicPolicy::All.wants_capture());
+        assert!(!QuicPolicy::Off.wants_capture());
     }
 }

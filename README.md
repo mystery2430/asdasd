@@ -227,7 +227,7 @@ Who that applies to is the whole point:
 | `--quic` | What happens |
 |---|---|
 | `blocked` *(default)* | Only destinations where a censor was actually caught resetting a connection lose HTTP/3. Everything else keeps it. |
-| `all` | Every HTTP/3 connection attempt on the machine is refused — GoodbyeDPI's approach, without its v1-only version pin. QUIC v1, v2 and unknown/draft versions are covered; ordinary UDP and established short-header QUIC packets are not matched. No learning needed; costs QUIC everywhere. |
+| `all` | Every HTTP/3 connection attempt on the machine is refused — GoodbyeDPI's approach, without its v1-only version pin. QUIC v1, v2 and unknown/draft versions are covered. The datagram is parsed before anything is dropped, so short-header (established) QUIC and UDP payloads that merely *look* like a long header are forwarded. No learning needed; costs QUIC everywhere. |
 | `off` | QUIC is never touched. A blocked site may keep failing over HTTP/3. |
 
 Under the default, a destination is marked only by a **real reset** (`DpiReset`
@@ -242,6 +242,17 @@ The unit here is an address, not a hostname, because a QUIC handshake carries
 no readable name. A blocked host sharing a CDN address with allowed ones
 therefore costs those hosts HTTP/3 too — they fall back to TCP and keep
 working, just without QUIC's speed advantage.
+
+What the classification cannot do is prove a datagram is QUIC. Nothing is
+decrypted and no connection is reassembled, so the checks are structural: a
+long header (RFC 9000 §17.2) with a valid connection-ID length, whose packet
+type says *Initial* for a known version (or any type for a version this build
+does not know, since a draft or future Initial opens a connection exactly like
+v1 does). A hand-crafted non-QUIC datagram that happens to parse that way, is
+at least 1200 bytes, and starts with a byte ≥ `0x80` is indistinguishable here
+and is refused under `all`. Random payloads almost never pass, because the
+connection-ID length byte alone rejects most of them, but this is a heuristic
+with a documented false-positive class rather than proof.
 
 ### Live network switching
 
