@@ -1,0 +1,310 @@
+name: manual build
+
+# Build on demand, choosing the version each crate carries.
+#
+# Every version box is optional: fill in only the crates you actually changed and
+# the rest keep the number they already have. A core-only fix can therefore ship
+# as core 0.2.0 while the CLI stays 0.1.0.
+#
+# `mode: test` builds and hands back a downloadable artifact and nothing else — no
+# commit, no tag, no Release. `mode: release` commits the bumps, tags the CLI's
+# version, and publishes a Release, but only in a second job that starts after the
+# build job has passed.
+#
+# Security shape, enforced by scripts/test-manual-workflow.ps1 in normal PR CI:
+#
+#   * the `build` job runs the whole test suite on input-influenced state, so it
+#     is read-only (`contents: read`) and contains no push/tag/publish step;
+#   * only the `release` job can write. It declares `contents: write`, it
+#     `needs: build`, and it exists only for `mode: release`;
+#   * no workflow input and no branch/ref value is spliced into a `run:` program.
+#     Inputs arrive as CORE_VERSION / DIVERT_VERSION / CLI_VERSION environment
+#     variables and are validated as strict SemVer 2.0.0 by
+#     scripts/apply-release-versions.ps1 before `cargo set-version` sees them; the
+#     branch arrives as $env:GITHUB_REF_NAME and is validated in PowerShell.
+
+on:
+  workflow_dispatch:
+    inputs:
+      core_version:
+        description: "bosphorus-core version (blank = leave unchanged)"
+        required: false
+        default: ""
+      divert_version:
+        description: "bosphorus-divert version (blank = leave unchanged)"
+        required: false
+        default: ""
+      cli_version:
+        description: "bosphorus-cli version — names the release (blank = leave unchanged)"
+        required: false
+        default: ""
+      mode:
+        description: "test = artifact only; release = commit, tag and publish"
+        type: choice
+        options: [test, release]
+        default: test
+
+env:
+  WINDIVERT_VERSION: 2.2.2
+  WINDIVERT_ASSET: WinDivert-2.2.2-A.zip
+
+jobs:
+  build:
+    runs-on: windows-latest
+    permissions:
+      contents: read
+    env:
+      # Inputs cross the boundary as data. Nothing below splices them into a
+      # program body.
+      CORE_VERSION: ${{ inputs.core_version }}
+      DIVERT_VERSION: ${{ inputs.divert_version }}
+      CLI_VERSION: ${{ inputs.cli_version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: rustup show
+
+      # A prebuilt cargo-edit, so the version edit is done by the tool that exists
+      # for it rather than by regexing Cargo.toml in a shell step.
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-edit
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+
+      # Shared semver.ps1 keeps this validator and the manifest reader in
+      # agreement; the self-test covers leading zeros, empty identifiers and
+      # injection payloads.
+      - name: Release-input validator self-test
+        shell: pwsh
+        run: pwsh -NoProfile -File ./scripts/apply-release-versions.ps1 -SelfTest
+
+      # Fails if the permission split, the release gating, or the
+      # no-interpolation rule is ever removed from this file.
+      - name: Manual-workflow safety checks
+        shell: pwsh
+        run: pwsh -NoProfile -File ./scripts/test-manual-workflow.ps1
+
+      # Reads the versions from the environment, validates all of them, and only
+      # then calls `cargo set-version` with each value as a separate argument.
+      - name: Apply the requested versions
+        shell: pwsh
+        run: pwsh -NoProfile -File ./scripts/apply-release-versions.ps1
+
+      # Cargo.lock must agree with the manifests or `--locked` below fails.
+      - name: Sync Cargo.lock
+        run: cargo update --workspace
+
+      - name: Resolved versions
+        shell: pwsh
+        run: pwsh -NoProfile -File ./scripts/resolve-release-versions.ps1
+
+      # Stop a release before it builds if its tag is already taken, rather than
+      # after the bumps have been pushed. Read-only: it asks the remote which tags
+      # exist, so this job never needs a write token.
+      - name: Check the release tag is free
+        if: inputs.mode == 'release'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          git ls-remote --exit-code --tags origin "refs/tags/v$env:cli_version" *> $null
+          if ($LASTEXITCODE -eq 0) {
+            Write-Error "tag v$env:cli_version already exists — give bosphorus-cli a new version"
+            exit 1
+          }
+          if ($LASTEXITCODE -ne 2) {
+            Write-Error "could not query the remote for tags (git ls-remote exit $LASTEXITCODE)"
+            exit 1
+          }
+          Write-Host "OK: v$env:cli_version is free"
+
+      - name: Fetch WinDivert ${{ env.WINDIVERT_VERSION }} runtime
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $url = "https://github.com/basil00/WinDivert/releases/download/v$env:WINDIVERT_VERSION/$env:WINDIVERT_ASSET"
+          Invoke-WebRequest -Uri $url -OutFile windivert.zip
+          Expand-Archive -Path windivert.zip -DestinationPath assets -Force
+
+      - name: Run tests
+        run: cargo test --workspace --locked
+
+      - name: Build (release-dist)
+        run: cargo build --workspace --profile release-dist --locked
+
+      - name: Smoke test the built binary
+        run: |
+          ./target/release-dist/bosphorus.exe --version
+          ./target/release-dist/bosphorus.exe --check-filters
+
+      - name: Stage artifact
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item target/release-dist/bosphorus.exe dist/
+          Copy-Item "assets/WinDivert-$env:WINDIVERT_VERSION-A/x64/WinDivert.dll" dist/
+          Copy-Item "assets/WinDivert-$env:WINDIVERT_VERSION-A/x64/WinDivert64.sys" dist/
+          Get-ChildItem dist | Format-Table Name, Length
+          (Get-FileHash -Algorithm SHA256 dist/bosphorus.exe).Hash
+
+      # The name carries the resolved versions and the commit, so an artifact is
+      # always traceable to the exact source that produced it. The release job
+      # resolves the same name from the same scripts.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bosphorus-v${{ env.cli_version }}-core${{ env.core_version }}-${{ github.sha }}
+          path: dist/
+          if-no-files-found: error
+
+  # --- release only, and only after the tested build above succeeded ---------
+
+  release:
+    needs: build
+    if: inputs.mode == 'release'
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    env:
+      CORE_VERSION: ${{ inputs.core_version }}
+      DIVERT_VERSION: ${{ inputs.divert_version }}
+      CLI_VERSION: ${{ inputs.cli_version }}
+    steps:
+      # Pinned to the commit the build job tested: `github.sha` is the same SHA
+      # that names the artifact, so the published files cannot come from a newer
+      # commit than the one that passed the tests.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.sha }}
+
+      - name: Install Rust toolchain
+        run: rustup show
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-edit
+
+      # Same inputs, same validator, same re-application: the committed manifests
+      # are exactly the ones the tested artifact was built from, and this job needs
+      # no input interpolation of its own.
+      - name: Apply the validated versions
+        shell: pwsh
+        run: pwsh -NoProfile -File ./scripts/apply-release-versions.ps1
+
+      - name: Sync Cargo.lock
+        run: cargo update --workspace
+
+      - name: Resolve the versions actually written
+        shell: pwsh
+        run: pwsh -NoProfile -File ./scripts/resolve-release-versions.ps1
+
+      # Same name the build job uploaded: resolved versions + exact commit SHA.
+      - uses: actions/download-artifact@v4
+        with:
+          name: bosphorus-v${{ env.cli_version }}-core${{ env.core_version }}-${{ github.sha }}
+          path: dist
+
+      - name: Verify the downloaded artifact is complete
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          foreach ($f in @("bosphorus.exe", "WinDivert.dll", "WinDivert64.sys")) {
+            $p = Join-Path "dist" $f
+            if (-not (Test-Path $p)) { throw "artifact is missing $f" }
+            if ((Get-Item $p).Length -eq 0) { throw "artifact file is empty: $f" }
+          }
+          Write-Host "artifact files verified"
+          (Get-FileHash -Algorithm SHA256 dist/bosphorus.exe).Hash
+
+      # Re-checked here as well as in `build`: the tag could have been taken while
+      # the build ran.
+      - name: Re-check the release tag is free
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          git ls-remote --exit-code --tags origin "refs/tags/v$env:cli_version" *> $null
+          if ($LASTEXITCODE -eq 0) {
+            Write-Error "tag v$env:cli_version was created while this build ran"
+            exit 1
+          }
+          if ($LASTEXITCODE -ne 2) {
+            Write-Error "could not query the remote for tags (git ls-remote exit $LASTEXITCODE)"
+            exit 1
+          }
+          Write-Host "OK: v$env:cli_version is still free"
+
+      # The ref comes from the environment. It is validated here as a plain branch
+      # name before it is used, because it ends up in a `git push` refspec.
+      - name: Validate the target branch
+        shell: pwsh
+        run: |
+          $ref = $env:GITHUB_REF_NAME
+          if ([string]::IsNullOrWhiteSpace($ref)) { throw "GITHUB_REF_NAME is empty" }
+          if ($ref -cnotmatch '^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$') {
+            throw "refusing to push to an unexpected branch name"
+          }
+          if ($ref -match '\.\.' -or $ref.EndsWith('.lock') -or $ref.EndsWith('/') -or $ref.EndsWith('.')) {
+            throw "refusing to push to a branch name that git would reject"
+          }
+          Write-Host "target branch: $ref"
+
+      # Fail closed if the branch moved while the build ran: the version commit is
+      # meant to land on top of the tested tree, never on top of someone else's
+      # work, and never by force.
+      - name: Verify the branch has not advanced
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $local = (git rev-parse HEAD).Trim()
+          $remote = (& git ls-remote origin "refs/heads/$($env:GITHUB_REF_NAME)") -split "`t" | Select-Object -First 1
+          if (-not $remote) { throw "cannot read the remote branch this release would push to" }
+          if ($remote.Trim() -ne $local) {
+            throw "branch $($env:GITHUB_REF_NAME) advanced during the build (remote $($remote.Trim()), local $local); re-run the release from the new head instead of overwriting it"
+          }
+          Write-Host "OK: $($env:GITHUB_REF_NAME) still points at $local"
+
+      - name: Commit the version bumps
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Cargo.lock crates/*/Cargo.toml
+          # Releasing without a version change is allowed; there is simply nothing
+          # to commit in that case.
+          if (git diff --cached --quiet) {
+            Write-Host "no version change to commit"
+          } else {
+            git commit -m "Release bosphorus-cli v$env:cli_version (core $env:core_version)"
+            # No --force: a rejected push means the branch moved after the check
+            # above, which must fail loudly rather than overwrite.
+            git push origin "HEAD:$env:GITHUB_REF_NAME"
+          }
+
+      - name: Tag the release
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          git tag "v$env:cli_version"
+          git push origin "v$env:cli_version"
+
+      - name: Zip release asset
+        shell: pwsh
+        run: Compress-Archive -Path dist/* -DestinationPath "bosphorus-v$env:cli_version-windows-x64.zip"
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ env.cli_version }}
+          name: bosphorus v${{ env.cli_version }}
+          body: |
+            `bosphorus.exe` ${{ env.cli_version }}, engine (bosphorus-core) ${{ env.core_version }}.
+
+            Unzip and run `bosphorus.exe`. Keep `WinDivert.dll` and
+            `WinDivert64.sys` next to it — moving the executable away from them
+            breaks the driver.
+          files: bosphorus-*-windows-x64.zip
+          generate_release_notes: true
