@@ -168,14 +168,32 @@ impl IspPool {
     /// `networks` never inflates. `promoted` is `(id, its score)` for every
     /// `Active`-with-strategy target — see [`Discovery::promoted_for_isp`].
     ///
-    /// [`Discovery::promoted_for_isp`]: crate::discovery::Discovery::promoted_for_isp
+    /// Replace this network's contribution to the pool with `promoted`.
+    ///
+    /// A contribution is a *snapshot of what this network currently promotes*,
+    /// not an append-only log: a strategy that stopped being promoted on this
+    /// network must stop contributing evidence, otherwise a strategy that once
+    /// worked here keeps counting towards [`Self::seeds`] (and towards
+    /// `MIN_NETWORKS`) long after the censor or the network moved on.
+    ///
+    /// So the merge is structured as: strip every contribution from `net_key`
+    /// across the whole pool, insert the new snapshot, then drop entries left
+    /// with no contributions at all. Contributions from *other* networks are
+    /// untouched, and the per-strategy cap plus ranking rules are unchanged.
     pub fn merge_session(
         &mut self,
         net_key: &str,
         promoted: &[(StrategyId, ScoredStrategy)],
         now_unix: u64,
     ) {
-        // Group this session's promotions by strategy id.
+        // 1. Forget what this network said last time. Doing this first (rather
+        //    than only for the ids in this snapshot) is what makes a strategy
+        //    that is no longer promoted stop contributing.
+        for entry in &mut self.entries {
+            entry.contributions.retain(|c| c.net_key != net_key);
+        }
+
+        // 2. Group this session's promotions by strategy id.
         let mut by_id: HashMap<StrategyId, (Strategy, u64, u64, u32, StrategyQuality)> =
             HashMap::new();
         for (id, sc) in promoted {
@@ -207,8 +225,9 @@ impl IspPool {
                     self.entries.last_mut().unwrap()
                 }
             };
-            // Replace this network's prior contribution, if any.
-            entry.contributions.retain(|c| c.net_key != net_key);
+            // `net_key` was removed from every entry above, so this is the
+            // network's only contribution.
+            debug_assert!(!entry.contributions.iter().any(|c| c.net_key == net_key));
             entry.contributions.push(contrib);
             if entry.contributions.len() > MAX_CONTRIBUTIONS {
                 entry
@@ -217,6 +236,9 @@ impl IspPool {
                 entry.contributions.truncate(MAX_CONTRIBUTIONS);
             }
         }
+
+        // 3. A strategy with no evidence left from any network is not evidence.
+        self.entries.retain(|e| !e.contributions.is_empty());
     }
 
     /// The seed list this pool contributes to a fresh `Discover` target: every
@@ -308,13 +330,20 @@ mod tests {
         let g = gen();
         let (a, b) = (g.all()[0].clone(), g.all()[1].clone());
         let mut pool = IspPool::new("acme");
-        // b on 3 networks, a on 2 — both pass the ratio gate.
+        // b on 3 networks, a on 2 — both pass the ratio gate. Each call is one
+        // network's *complete* promoted set, so both strategies go in the same
+        // snapshot for a shared network.
         for n in ["n1", "n2"] {
-            pool.merge_session(n, &[(a.id(), score(a.clone(), 4, 3))], 1);
+            pool.merge_session(
+                n,
+                &[
+                    (a.id(), score(a.clone(), 4, 3)),
+                    (b.id(), score(b.clone(), 4, 3)),
+                ],
+                1,
+            );
         }
-        for n in ["n1", "n2", "n3"] {
-            pool.merge_session(n, &[(b.id(), score(b.clone(), 4, 3))], 1);
-        }
+        pool.merge_session("n3", &[(b.id(), score(b.clone(), 4, 3))], 1);
         assert_eq!(
             pool.seeds(),
             vec![(b.id(), SeedTier::IspPool), (a.id(), SeedTier::IspPool)],
@@ -447,5 +476,131 @@ mod tests {
             !SeedTier::IspPool.is_high_confidence(),
             "must not trigger Probe-skip"
         );
+    }
+
+    /// Regression: `merge_session` only replaced this network's contribution for
+    /// strategies present in the new snapshot. A strategy that dropped out of the
+    /// snapshot kept its old contribution from this network, so it could still
+    /// count as corroborated and keep being seeded.
+    #[test]
+    fn a_strategy_dropped_by_the_same_network_stops_contributing() {
+        let g = gen();
+        let (a, b) = (g.all()[0].clone(), g.all()[1].clone());
+        let mut pool = IspPool::new("acme");
+
+        // net1 promotes both.
+        pool.merge_session(
+            "net1",
+            &[
+                (a.id(), score(a.clone(), 4, 4)),
+                (b.id(), score(b.clone(), 4, 4)),
+            ],
+            100,
+        );
+        assert_eq!(pool.entries.len(), 2);
+
+        // net1's *next* session promotes only a. b's net1 evidence must be
+        // withdrawn; before the fix it stayed and kept b corroborated.
+        pool.merge_session("net1", &[(a.id(), score(a.clone(), 4, 4))], 200);
+
+        assert!(
+            !pool.entries.iter().any(|e| e.strategy.id() == b.id()),
+            "b had evidence only from net1, so withdrawing it removes the entry"
+        );
+        assert_eq!(
+            pool.entries
+                .iter()
+                .find(|e| e.strategy.id() == a.id())
+                .map(|e| e.contributions.len()),
+            Some(1),
+            "a keeps exactly its refreshed net1 contribution"
+        );
+        assert!(
+            !pool.seeds().iter().any(|(id, _)| *id == b.id()),
+            "a strategy with no remaining evidence must not be seeded"
+        );
+
+        // Now net2 corroborates a: a is a real cross-network seed.
+        pool.merge_session("net2", &[(a.id(), score(a.clone(), 4, 4))], 300);
+        assert_eq!(pool.seeds(), vec![(a.id(), SeedTier::IspPool)]);
+        assert!(
+            !pool.entries.iter().any(|e| e.strategy.id() == b.id()),
+            "b is still gone"
+        );
+    }
+
+    /// An empty snapshot means "this network promotes nothing now", so it must
+    /// withdraw its evidence rather than leave the old numbers behind.
+    #[test]
+    fn an_empty_snapshot_withdraws_that_networks_evidence() {
+        let g = gen();
+        let a = g.all()[0].clone();
+        let mut pool = IspPool::new("acme");
+        pool.merge_session("net1", &[(a.id(), score(a.clone(), 5, 5))], 100);
+        pool.merge_session("net2", &[(a.id(), score(a.clone(), 5, 5))], 100);
+        assert_eq!(pool.seeds(), vec![(a.id(), SeedTier::IspPool)]);
+
+        pool.merge_session("net2", &[], 200);
+        assert!(
+            pool.seeds().is_empty(),
+            "one network is not corroboration, so nothing may be seeded"
+        );
+        assert_eq!(pool.entries.len(), 1);
+        assert_eq!(pool.entries[0].contributions.len(), 1);
+        assert_eq!(pool.entries[0].contributions[0].net_key, "net1");
+
+        // Withdrawing the last network removes the entry entirely.
+        pool.merge_session("net1", &[], 300);
+        assert!(pool.entries.is_empty(), "no contributions -> no entry");
+        assert!(pool.seeds().is_empty());
+    }
+
+    /// Other networks' evidence must survive one network withdrawing.
+    #[test]
+    fn withdrawing_one_network_preserves_the_others() {
+        let g = gen();
+        let a = g.all()[0].clone();
+        let mut pool = IspPool::new("acme");
+        for (i, n) in ["net1", "net2", "net3"].iter().enumerate() {
+            pool.merge_session(n, &[(a.id(), score(a.clone(), 3, 3))], 10 + i as u64);
+        }
+        assert_eq!(pool.entries[0].contributions.len(), 3);
+
+        pool.merge_session("net1", &[], 400);
+        let keys: Vec<&str> = pool.entries[0]
+            .contributions
+            .iter()
+            .map(|c| c.net_key.as_str())
+            .collect();
+        assert_eq!(keys, vec!["net2", "net3"], "net1 gone, net2/net3 kept");
+        assert_eq!(
+            pool.entries[0].contributions[0].last_seen, 11,
+            "the surviving evidence is unchanged"
+        );
+        assert_eq!(pool.entries[0].contributions[1].last_seen, 12);
+        assert_eq!(pool.entries[0].networks(), 2);
+        // Still seed-worthy: two networks remain.
+        assert_eq!(pool.seeds(), vec![(a.id(), SeedTier::IspPool)]);
+    }
+
+    /// The per-network cap keeps working after the rewrite (a re-promoted
+    /// strategy replaces its own contribution instead of adding a second one).
+    #[test]
+    fn repeated_promotion_across_networks_still_caps_contributions() {
+        let g = gen();
+        let a = g.all()[0].clone();
+        let mut pool = IspPool::new("acme");
+        for i in 0..(MAX_CONTRIBUTIONS as u64 + 3) {
+            pool.merge_session(&format!("net{i}"), &[(a.id(), score(a.clone(), 2, 2))], i);
+        }
+        assert_eq!(pool.entries.len(), 1);
+        assert_eq!(pool.entries[0].contributions.len(), MAX_CONTRIBUTIONS);
+        // Re-promoting an existing network must not grow the list.
+        pool.merge_session("net30", &[(a.id(), score(a.clone(), 2, 2))], 999);
+        assert_eq!(pool.entries[0].contributions.len(), MAX_CONTRIBUTIONS);
+        assert!(pool.entries[0]
+            .contributions
+            .iter()
+            .any(|c| c.net_key == "net30" && c.last_seen == 999));
     }
 }

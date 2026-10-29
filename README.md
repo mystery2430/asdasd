@@ -110,9 +110,15 @@ narrow slice of traffic (filter fragments taken verbatim from GoodbyeDPI):
 
 Everything else on the machine is untouched. Non-IP and non-TCP packets pass
 straight through. The per-packet loop runs inside `catch_unwind`, so a single
-malformed packet degrades to one log line rather than killing the process. If a
-transform panics, its partial send batch is discarded, the original bytes and
-metadata are restored, and that original packet is forwarded.
+malformed packet degrades to one log line rather than killing the process.
+
+If a transform panics, the partial send batch is discarded and the captured
+packet is forwarded **unchanged** — the engine never mutates the captured buffer
+(it is passed by shared reference), so there is nothing to restore. Capture then
+stops: `process` updates connection tracking, discovery and the flow's trial
+before it builds a strategy, so after an unwind that state may describe a
+half-finished trial. Continuing to make decisions from it would be worse than
+stopping, and the caller reports the panic as an error.
 
 ### Connection tracking & verdicts
 

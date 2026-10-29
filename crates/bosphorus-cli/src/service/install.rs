@@ -57,7 +57,9 @@ pub fn install(opts: &Opts) -> anyhow::Result<()> {
     println!("{}", crate::i18n::t(crate::i18n::Msg::DiscoveryWarning));
     println!();
 
-    let exe = resolve_exe(opts)?;
+    // Held for the whole function: `_dir_guard` keeps the validated directory
+    // pinned until the service has been created and started.
+    let target = resolve_install(opts)?;
     preflight_windivert(opts.force)?;
 
     let profile_dir = opts.profile_dir.clone().unwrap_or_else(super::profiles_dir);
@@ -82,7 +84,7 @@ pub fn install(opts: &Opts) -> anyhow::Result<()> {
             ServiceStartType::AutoStart
         },
         error_control: ServiceErrorControl::Normal,
-        executable_path: exe,
+        executable_path: target.exe.clone(),
         launch_arguments,
         dependencies: vec![],
         account_name: None, // LocalSystem
@@ -181,11 +183,12 @@ fn default_install_dir() -> PathBuf {
     default_install_dir_from(std::env::var_os("ProgramFiles"))
 }
 
-/// Absolute path to register as the service binary. The exe and both WinDivert
-/// files are always copied to an administrator-controlled directory; the
-/// previous default (run in place) let an unprivileged user replace a
-/// LocalSystem binary or its DLLs.
-fn resolve_exe(opts: &Opts) -> anyhow::Result<PathBuf> {
+/// Copy the service files into place and return the path to register.
+///
+/// The exe and both WinDivert files are always copied to an
+/// administrator-controlled directory; the previous default (run in place) let
+/// an unprivileged user replace a LocalSystem binary or its DLLs.
+fn resolve_install(opts: &Opts) -> anyhow::Result<InstallTarget> {
     let current = std::env::current_exe()?;
     let requested = opts.install_dir.clone().unwrap_or_else(default_install_dir);
 
@@ -195,12 +198,36 @@ fn resolve_exe(opts: &Opts) -> anyhow::Result<PathBuf> {
     // spelling let a reparse point (junction/symlink) or a `..` component point
     // the copy — and therefore the LocalSystem service binary — somewhere the
     // check never saw.
-    let dst_dir = prepare_install_dir(&requested, directory_is_safe)?;
-    copy_install_files(&current, &dst_dir)?;
+    let dir = prepare_install_dir(&requested, directory_is_safe)?;
 
-    let exe = dst_dir.join("bosphorus.exe");
-    verify_resolves_inside(&exe, &dst_dir)?;
-    Ok(service_path(&exe))
+    // Close the check-then-use window as far as Windows allows: hold the
+    // validated directory open without `FILE_SHARE_DELETE`, so nothing can
+    // rename, delete or replace it while the files are copied and the service is
+    // registered. The guard lives in `InstallTarget`, i.e. until `install()`
+    // returns.
+    let guard = DirectoryGuard::hold(&dir)?;
+
+    copy_install_files(&current, &dir)?;
+
+    let exe = dir.join("bosphorus.exe");
+    verify_resolves_inside(&exe, &dir)?;
+    Ok(InstallTarget {
+        exe: service_path(&exe),
+        dir,
+        _dir_guard: guard,
+    })
+}
+
+/// Where the service files went. Keeping this as one value makes it hard to use
+/// the executable path after the directory guard has been dropped.
+struct InstallTarget {
+    /// Spelling to register with the SCM; resolves to `dir/bosphorus.exe`.
+    exe: PathBuf,
+    /// Canonical, validated install directory.
+    #[allow(dead_code)]
+    dir: PathBuf,
+    /// Held open (Windows: without `FILE_SHARE_DELETE`) for the whole install.
+    _dir_guard: DirectoryGuard,
 }
 
 /// Windows verbatim-path prefix, as produced by `canonicalize()`.
@@ -225,22 +252,32 @@ fn service_path(validated: &Path) -> PathBuf {
     }
 }
 
-/// Create the destination, then prove that *this* path is safe to install a
-/// LocalSystem binary into. Returns the canonical path callers must use.
+/// Create the destination, then prove that *this* path and every directory above
+/// it are safe to install a LocalSystem binary into. Returns the canonical path
+/// callers must use.
 ///
 /// `probe` returns `true` only when a directory is administrator-controlled (see
 /// [`bosphorus_core::service_acl`]). Injecting it keeps the decision testable
 /// without installing a service or editing real ACLs.
 ///
-/// Three separate conditions are required:
+/// Conditions, each of which an attacker needs only one of:
 ///
-/// 1. the directory itself is administrator-controlled, so its contents cannot
-///    be replaced;
-/// 2. its **parent** is too — `FILE_DELETE_CHILD` on the parent lets an ordinary
-///    user delete and recreate this directory (and then control its contents),
-///    no matter how tight the directory's own ACL is;
+/// 1. the directory itself is administrator-controlled, so its contents cannot be
+///    replaced;
+/// 2. **every ancestor up to the volume root** is too. Checking only the parent
+///    is not enough: `FILE_DELETE_CHILD` (or write access) on a grandparent lets
+///    an ordinary user rename or delete the whole chain below it — including the
+///    already-checked parent — and re-create it under their control. On a normal
+///    machine this walks a handful of directories: `C:\` grants ordinary users
+///    only read/execute, so a default `%ProgramFiles%\Bosphorus` passes;
 /// 3. the path still resolves to the same place after the check, so a reparse
 ///    point cannot be swapped in between the probe and the copy.
+///
+/// The remaining race — an ancestor being changed between this walk and the copy
+/// — is narrowed by [`DirectoryGuard`], which pins the final directory, and by
+/// re-verifying the written executable afterwards. It is not eliminated for
+/// ancestors: a caller that controls them is already a caller that can rewrite
+/// the binary directly.
 ///
 /// Finally the directory's ACL is rewritten to an explicit administrator-only
 /// DACL, so a destination that already existed with inherited or altered
@@ -257,24 +294,29 @@ fn prepare_install_dir(
         )
     })?;
 
-    if !probe(&canonical)? {
-        anyhow::bail!(
-            "refusing to install a LocalSystem service in '{}': the directory is writable by \
-             an unprivileged principal. Choose an administrator-controlled path or omit \
-             --install-dir to use {}.",
-            canonical.display(),
-            default_install_dir().display()
-        );
-    }
-
-    if let Some(parent) = canonical.parent() {
-        if !probe(parent)? {
+    // Walk from the destination up to the volume root. `Path::ancestors` yields
+    // the path itself, then each parent, ending at the root (never ""), so the
+    // root's own DACL is evaluated too — and a root that ordinary users could
+    // write to is exactly the case that must fail closed.
+    for ancestor in canonical.ancestors() {
+        if !probe(ancestor)? {
+            if ancestor == canonical {
+                anyhow::bail!(
+                    "refusing to install a LocalSystem service in '{}': the directory is \
+                     writable by an unprivileged principal. Choose an administrator-controlled \
+                     path or omit --install-dir to use {}.",
+                    canonical.display(),
+                    default_install_dir().display()
+                );
+            }
             anyhow::bail!(
-                "refusing to install a LocalSystem service in '{}': its parent '{}' can be \
-                 modified by an unprivileged principal, which is enough to replace the whole \
-                 directory after it has been checked.",
+                "refusing to install a LocalSystem service in '{}': the ancestor '{}' can be \
+                 modified by an unprivileged principal, which is enough to replace every \
+                 directory below it (including this one) after it has been checked. Choose an \
+                 administrator-controlled path or omit --install-dir to use {}.",
                 canonical.display(),
-                parent.display()
+                ancestor.display(),
+                default_install_dir().display()
             );
         }
     }
@@ -322,6 +364,82 @@ fn verify_resolves_inside(path: &Path, dir: &Path) -> anyhow::Result<()> {
         );
     }
     Ok(())
+}
+
+/// Pins a directory for the duration of the install so it cannot be renamed,
+/// deleted or swapped for a reparse point between validation and registration.
+///
+/// Implemented with the standard Windows share-mode trick: a handle opened
+/// without `FILE_SHARE_DELETE` makes any rename/delete of that directory fail
+/// with a sharing violation while the handle is open. Read/write sharing is still
+/// allowed, so copying files *into* the directory keeps working.
+#[cfg(windows)]
+struct DirectoryGuard(windows::Win32::Foundation::HANDLE);
+
+#[cfg(windows)]
+impl DirectoryGuard {
+    fn hold(dir: &Path) -> anyhow::Result<Self> {
+        use std::os::windows::ffi::OsStrExt;
+
+        use windows::core::PCWSTR;
+        use windows::Win32::Storage::FileSystem::{
+            CreateFileW, FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE,
+            OPEN_EXISTING,
+        };
+
+        let wide: Vec<u16> = dir
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        // `FILE_FLAG_BACKUP_SEMANTICS` is required to open a directory at all;
+        // `FILE_FLAG_OPEN_REPARSE_POINT` makes sure we pin the directory that was
+        // validated rather than following a link planted since.
+        let flags = FILE_FLAGS_AND_ATTRIBUTES(
+            windows::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS.0
+                | windows::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT.0,
+        );
+        // SAFETY: `wide` is NUL-terminated and outlives the call; the returned
+        // handle is owned by `DirectoryGuard` and closed in `Drop`.
+        let handle = unsafe {
+            CreateFileW(
+                PCWSTR(wide.as_ptr()),
+                0, // no data access needed; share mode is what protects us
+                FILE_SHARE_READ | FILE_SHARE_WRITE, // deliberately no FILE_SHARE_DELETE
+                None,
+                OPEN_EXISTING,
+                flags,
+                None,
+            )
+        }
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "cannot pin the install directory '{}' for the copy: {e}",
+                dir.display()
+            )
+        })?;
+        Ok(Self(handle))
+    }
+}
+
+#[cfg(windows)]
+impl Drop for DirectoryGuard {
+    fn drop(&mut self) {
+        // SAFETY: `self.0` is a handle returned by CreateFileW and closed once.
+        unsafe {
+            let _ = windows::Win32::Foundation::CloseHandle(self.0);
+        }
+    }
+}
+
+#[cfg(not(windows))]
+struct DirectoryGuard;
+
+#[cfg(not(windows))]
+impl DirectoryGuard {
+    fn hold(_dir: &Path) -> anyhow::Result<Self> {
+        Ok(Self)
+    }
 }
 
 /// Restrict `path` to an explicit administrator-only ACL. Windows-only; a no-op
@@ -868,8 +986,121 @@ mod tests {
         let err = prepare_install_dir(&target, |p| Ok(p != canonical_parent))
             .expect_err("a user-writable parent must be rejected");
         let text = err.to_string();
-        assert!(text.contains("parent"), "{text}");
+        assert!(text.contains("ancestor"), "{text}");
         assert!(text.contains("refusing to install"), "{text}");
+    }
+
+    /// Regression: only the immediate parent used to be checked. Write access on
+    /// a *higher* ancestor is enough for an ordinary user to rename or delete the
+    /// whole chain below it — including the already-checked parent — and put a
+    /// directory of their own in its place, so every ancestor must be checked.
+    #[test]
+    fn an_unsafe_ancestor_above_the_parent_is_refused() {
+        let root = TempDir::new("grandparent");
+        let grandparent = root.path().join("gp");
+        let target = grandparent.join("parent").join("Bosphorus");
+        let canonical_gp = grandparent.canonicalize().unwrap();
+
+        let probed = std::cell::RefCell::new(Vec::new());
+        let err = prepare_install_dir(&target, |p| {
+            probed.borrow_mut().push(p.to_path_buf());
+            Ok(*p != canonical_gp)
+        })
+        .expect_err("a user-writable grandparent must be rejected");
+        let text = err.to_string();
+        assert!(
+            text.contains("ancestor") && text.contains("gp"),
+            "the message must name the offending ancestor: {text}"
+        );
+        assert!(
+            probed.borrow().contains(&canonical_gp),
+            "the grandparent must actually have been probed"
+        );
+    }
+
+    /// Every directory from the destination up to the volume root is probed, so
+    /// nothing in the chain can be silently skipped.
+    #[test]
+    fn the_whole_ancestor_chain_up_to_the_root_is_probed() {
+        let root = TempDir::new("chain");
+        let target = root.path().join("a").join("b").join("Bosphorus");
+        let probed = std::cell::RefCell::new(Vec::new());
+        let canonical = prepare_install_dir(&target, |p| {
+            probed.borrow_mut().push(p.to_path_buf());
+            Ok(true)
+        })
+        .expect("all-safe chain accepted");
+
+        let expected: Vec<PathBuf> = canonical.ancestors().map(Path::to_path_buf).collect();
+        let seen = probed.borrow();
+        for path in &expected {
+            assert!(seen.contains(path), "ancestor {path:?} was never probed");
+        }
+        // The walk really does end at the filesystem root, not at some arbitrary
+        // depth: the root has no parent and must be in the list.
+        let fs_root = expected.last().expect("at least one ancestor");
+        assert_eq!(
+            fs_root.parent(),
+            None,
+            "last probed ancestor must be the root"
+        );
+    }
+
+    /// A normal administrator-controlled chain (`C:\Program Files\Bosphorus`,
+    /// modelled as root + Program Files + install dir) installs; this is the
+    /// policy-level companion to the Windows ACL behaviour, which needs a real
+    /// Windows machine to verify.
+    #[test]
+    fn an_administrator_controlled_chain_is_accepted() {
+        use bosphorus_core::service_acl::{evaluate, AceEntry};
+
+        const SYSTEM: &str = "S-1-5-18";
+        const ADMIN: &str = "S-1-5-32-544";
+        const TI: &str = "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464";
+        const CREATOR_OWNER: &str = "S-1-3-0";
+        const USERS: &str = "S-1-5-32-545";
+
+        // Stock `C:\`: SYSTEM/Administrators full, inherited CREATOR OWNER,
+        // ordinary users read+execute only.
+        let root_dacl = [
+            AceEntry::allow(0x001F_01FF, SYSTEM),
+            AceEntry::allow(0x001F_01FF, ADMIN),
+            AceEntry::allow_inherited(0x001F_01FF, CREATOR_OWNER),
+            AceEntry::allow_inherited(0x0012_00A9, USERS),
+        ];
+        // Stock `C:\Program Files`: owned by TrustedInstaller.
+        let pf_dacl = root_dacl.clone();
+        // A directory the installer just created and locked down.
+        let install_dacl = [
+            AceEntry::allow(0x001F_01FF, SYSTEM),
+            AceEntry::allow(0x001F_01FF, ADMIN),
+            AceEntry::allow_inherited(0x0012_00A9, USERS),
+        ];
+
+        for dacl in [&root_dacl[..], &pf_dacl[..], &install_dacl[..]] {
+            // Administrator-owned roots (Program Files is usually TrustedInstaller).
+            assert_eq!(evaluate(Some(TI), dacl), Ok(()));
+            assert_eq!(evaluate(Some(ADMIN), dacl), Ok(()));
+        }
+        // The same DACL owned by an ordinary account is still refused, which is
+        // what stops the check from being weakened for `%USERPROFILE%`.
+        assert!(evaluate(Some("S-1-5-21-1-2-3-1001"), &root_dacl).is_err());
+
+        // And the installer accepts the chain when every directory probes safe.
+        let dir = TempDir::new("admin-chain");
+        let target = dir.path().join("Bosphorus");
+        prepare_install_dir(&target, |_| Ok(true)).expect("administrator chain accepted");
+    }
+
+    /// Non-Windows runs must not skip the guard silently in a way that changes
+    /// behaviour; the no-op guard is explicit and cheap.
+    #[test]
+    fn the_directory_guard_is_constructible_on_this_platform() {
+        let dir = TempDir::new("guard");
+        let target = dir.path().join("Bosphorus");
+        std::fs::create_dir_all(&target).unwrap();
+        let guard = DirectoryGuard::hold(&target).expect("guard");
+        drop(guard);
     }
 
     /// A registration path that resolves outside the validated directory must be
