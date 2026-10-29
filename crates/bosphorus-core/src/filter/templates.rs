@@ -26,7 +26,13 @@ pub const NO_LOCALNETS_V6_SRC: &str = "((ipv6.SrcAddr > ::1) and (ipv6.SrcAddr <
 /// connection and ordinary UDP/443 payloads do not match. Used only for
 /// [`QuicPolicy::All`](crate::config::QuicPolicy::All); the engine never sees
 /// these packets because the driver drops them.
-pub const QUIC_DROP: &str = "outbound and !impostor and !loopback and udp and udp.DstPort == 443 and udp.PayloadLength >= 1200 and udp.Payload[0] >= 0xC0";
+///
+/// `{min_first_byte}` is filled from
+/// [`LONG_HEADER_FIRST_BYTE_MIN`](crate::packet::quic::LONG_HEADER_FIRST_BYTE_MIN),
+/// which is `0x80`: the header-form bit alone. A literal `0xC0` threshold also
+/// demanded the fixed bit, so a long header whose fixed bit was greased to zero
+/// (RFC 9287) escaped the blanket drop entirely.
+pub const QUIC_DROP: &str = "outbound and !impostor and !loopback and udp and udp.DstPort == 443 and udp.PayloadLength >= 1200 and udp.Payload[0] >= {min_first_byte}";
 
 /// Ours, not GoodbyeDPI's: the capture clause for
 /// [`QuicPolicy::Blocked`](crate::config::QuicPolicy::Blocked), where the drop
@@ -42,7 +48,12 @@ pub const QUIC_DROP: &str = "outbound and !impostor and !loopback and udp and ud
 /// datagram containing an Initial to at least 1200 bytes, so nothing that opens
 /// a connection can slip past, while the short packets of an established
 /// connection never reach the engine.
-pub const QUIC_SELECTIVE_FMT: &str = "(outbound and !impostor and !loopback and udp and {dst_ports} and udp.PayloadLength >= 1200 and udp.Payload[0] >= 0xC0 and ({v4dst} or {v6dst}))";
+///
+/// `{min_first_byte}` is the header-form bit (`0x80`), not `0xC0`: see
+/// [`QUIC_DROP`] and [`LONG_HEADER_FIRST_BYTE_MIN`](crate::packet::quic::LONG_HEADER_FIRST_BYTE_MIN).
+/// A greased-fixed-bit Initial is still an Initial, and it reaches the parser
+/// only if this coarse gate lets it through.
+pub const QUIC_SELECTIVE_FMT: &str = "(outbound and !impostor and !loopback and udp and {dst_ports} and udp.PayloadLength >= 1200 and udp.Payload[0] >= {min_first_byte} and ({v4dst} or {v6dst}))";
 
 /// `maxpayloadsize_str` (goodbyedpi.c:242-245) — verbatim, with GoodbyeDPI's
 /// `%hu` replaced by the `{n}` placeholder. "GET " = 0x47455420,

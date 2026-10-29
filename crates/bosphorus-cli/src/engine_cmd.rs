@@ -730,7 +730,10 @@ pub fn run_engine(opts: EngineOpts) -> anyhow::Result<()> {
     let engine = Arc::new(engine);
 
     // Tick thread: sweep idle flows + resolve verdict timeouts (~2 Hz).
-    {
+    // The handle is kept: shutdown must join it before the final profile flush,
+    // otherwise a tick that is already inside `maybe_persist` can rename its
+    // (older) snapshot over the shutdown write.
+    let tick_thread = {
         let engine = Arc::clone(&engine);
         let stop = Arc::clone(&stop);
         std::thread::spawn(move || {
@@ -738,8 +741,8 @@ pub fn run_engine(opts: EngineOpts) -> anyhow::Result<()> {
                 engine.tick(std::time::Instant::now());
                 std::thread::sleep(Duration::from_millis(500));
             }
-        });
-    }
+        })
+    };
 
     // Live network-change watch (interactive parity with the service): a route
     // or unicast-address change arms a debounced NetKey re-check on the tick
@@ -771,7 +774,13 @@ pub fn run_engine(opts: EngineOpts) -> anyhow::Result<()> {
     };
 
     let run = engine.run_main(&mut src, &mut sink, &stop);
+    // Shutdown ordering: stop the periodic worker, unregister the route-change
+    // callback, join the worker, and only then take the final snapshot. The
+    // sequenced writer (`persist::save_snapshot`) is the second line of defence:
+    // even an in-flight write that completes late cannot roll the file back.
+    stop.stop();
     drop(_netwatch); // stop callbacks before the final flush
+    let _ = tick_thread.join(); // no writer may outlive the final flush
     engine.persist_now(); // flush the discovery profile even on a run error
 
     // Feature C: fold this session's promotions into the ISP seed pool.

@@ -266,17 +266,25 @@ fn copy_install_files(current_exe: &Path, dst_dir: &Path) -> anyhow::Result<()> 
     Ok(())
 }
 
-/// Actual DACL inspection for the directory the SYSTEM service will load from.
+/// Actual DACL + owner inspection for the directory the SYSTEM service will
+/// load from.
 ///
-/// This is intentionally conservative: any allow ACE for Everyone,
-/// Authenticated Users, INTERACTIVE, or the built-in Users group that grants a
-/// write, delete, WRITE_DAC, WRITE_OWNER, GENERIC_WRITE, or GENERIC_ALL bit
-/// rejects the location. A NULL DACL means full access and is rejected too.
+/// The access decision itself is [`service_acl::evaluate`] so it can be tested
+/// without Windows. This function only reads the security descriptor:
+///
+/// * a NULL DACL grants everyone full control -> reject,
+/// * every ACE is passed through, including ones for individual user SIDs (a
+///   `%USERPROFILE%` install dir inherits those), object/callback ACEs, and ACEs
+///   whose SID cannot be resolved; the policy treats all three as untrusted,
+/// * a directory owned by a non-administrator is rejected, because an owner can
+///   always rewrite its DACL (`WRITE_DAC` is implicit for owners) even when the
+///   current ACEs name only administrators.
 #[cfg(windows)]
 fn directory_is_safe(path: &Path) -> std::io::Result<bool> {
     use std::ffi::c_void;
     use std::os::windows::ffi::OsStrExt;
 
+    use bosphorus_core::service_acl::{self, AceEntry};
     use windows::core::{PCWSTR, PWSTR};
     use windows::Win32::Foundation::{HLOCAL, PSID, WIN32_ERROR};
     use windows::Win32::Security::Authorization::{
@@ -284,30 +292,10 @@ fn directory_is_safe(path: &Path) -> std::io::Result<bool> {
     };
     use windows::Win32::Security::{
         AclSizeInformation, GetAce, GetAclInformation, ACCESS_ALLOWED_ACE, ACL,
-        ACL_SIZE_INFORMATION, DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
+        ACL_SIZE_INFORMATION, DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION,
+        PSECURITY_DESCRIPTOR,
     };
     use windows::Win32::System::Memory::LocalFree;
-
-    const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
-    const FILE_WRITE_DATA: u32 = 0x0000_0002;
-    const FILE_APPEND_DATA: u32 = 0x0000_0004;
-    const FILE_WRITE_EA: u32 = 0x0000_0010;
-    const DELETE: u32 = 0x0001_0000;
-    const FILE_DELETE_CHILD: u32 = 0x0000_0040;
-    const WRITE_DAC: u32 = 0x0004_0000;
-    const WRITE_OWNER: u32 = 0x0008_0000;
-    const GENERIC_ALL: u32 = 0x1000_0000;
-    const GENERIC_WRITE: u32 = 0x4000_0000;
-    const DANGEROUS: u32 = FILE_WRITE_DATA
-        | FILE_APPEND_DATA
-        | FILE_WRITE_EA
-        | DELETE
-        | FILE_DELETE_CHILD
-        | WRITE_DAC
-        | WRITE_OWNER
-        | GENERIC_ALL
-        | GENERIC_WRITE;
-    const BROAD_SIDS: [&str; 4] = ["S-1-1-0", "S-1-5-11", "S-1-5-32-545", "S-1-5-4"];
 
     struct Descriptor(PSECURITY_DESCRIPTOR);
     impl Drop for Descriptor {
@@ -332,11 +320,27 @@ fn directory_is_safe(path: &Path) -> std::io::Result<bool> {
         }
     }
 
+    /// Copy a SID into its string form (`S-1-5-...`). `None` = unusable SID.
+    ///
+    /// SAFETY: `sid` must point at a valid SID for the duration of the call.
+    unsafe fn sid_to_string(sid: PSID) -> Option<String> {
+        if sid.0.is_null() {
+            return None;
+        }
+        let mut text = PWSTR::null();
+        if !ConvertSidToStringSidW(sid, &mut text).as_bool() {
+            return None;
+        }
+        let guard = SidString(text);
+        guard.0.to_string().ok()
+    }
+
     let wide: Vec<u16> = path
         .as_os_str()
         .encode_wide()
         .chain(std::iter::once(0))
         .collect();
+    let mut owner = PSID::default();
     let mut dacl: *mut ACL = std::ptr::null_mut();
     let mut sd = PSECURITY_DESCRIPTOR::default();
     // SAFETY: `wide` is NUL-terminated and lives for the call; both out-params
@@ -345,8 +349,8 @@ fn directory_is_safe(path: &Path) -> std::io::Result<bool> {
         GetNamedSecurityInfoW(
             PCWSTR(wide.as_ptr()),
             SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION,
-            None,
+            DACL_SECURITY_INFORMATION | OWNER_SECURITY_INFORMATION,
+            Some(&mut owner),
             None,
             Some(&mut dacl),
             None,
@@ -357,8 +361,16 @@ fn directory_is_safe(path: &Path) -> std::io::Result<bool> {
     if status.0 != 0 {
         return Err(std::io::Error::from_raw_os_error(status.0 as i32));
     }
+    let owner_sid = unsafe { sid_to_string(owner) };
     if dacl.is_null() {
-        return Ok(false); // NULL DACL = everyone
+        // NULL DACL = everyone. Report the specific reason, then fail closed.
+        tracing::warn!(
+            target: "bosphorus::service",
+            path = %path.display(),
+            reason = %service_acl::AclRejection::NullDacl.describe(),
+            "install directory rejected by ACL policy"
+        );
+        return Ok(false);
     }
 
     let mut info = ACL_SIZE_INFORMATION::default();
@@ -375,42 +387,49 @@ fn directory_is_safe(path: &Path) -> std::io::Result<bool> {
         return Err(std::io::Error::last_os_error());
     }
 
+    let mut entries: Vec<AceEntry> = Vec::with_capacity(info.AceCount as usize);
     for index in 0..info.AceCount {
         let mut ace: *mut c_void = std::ptr::null_mut();
         // SAFETY: index < AceCount and `ace` is a valid out-param.
         if !unsafe { GetAce(dacl, index, &mut ace) }.as_bool() || ace.is_null() {
-            continue;
+            // A DACL we cannot read must not be treated as safe.
+            return Ok(false);
         }
-        // SAFETY: GetAce returned a pointer to an ACE inside the DACL block.
-        let allowed = unsafe { &*(ace as *const ACCESS_ALLOWED_ACE) };
-        if allowed.Header.AceType != ACCESS_ALLOWED_ACE_TYPE || allowed.Mask & DANGEROUS == 0 {
-            continue;
-        }
-        let sid_offset = std::mem::offset_of!(ACCESS_ALLOWED_ACE, SidStart);
-        // SAFETY: for an ACCESS_ALLOWED_ACE the SID begins at SidStart.
-        let sid = PSID(unsafe { (ace as *mut u8).add(sid_offset) } as *mut c_void);
-        let mut sid_string = PWSTR::null();
-        // SAFETY: `sid` points inside the live ACE; out-param is valid.
-        if !unsafe { ConvertSidToStringSidW(sid, &mut sid_string) }.as_bool() {
-            continue;
-        }
-        let sid_string = SidString(sid_string);
-        // SAFETY: conversion succeeded, so the string is NUL-terminated.
-        let text = unsafe { sid_string.0.to_string() }.unwrap_or_default();
-        if BROAD_SIDS.iter().any(|broad| *broad == text) {
+        // SAFETY: every file-object ACE starts with ACE_HEADER (AceType) followed
+        // by an ACCESS_MASK, so this read is layout-compatible for allow, deny,
+        // object and callback ACEs.
+        let header = unsafe { &*(ace as *const ACCESS_ALLOWED_ACE) };
+        let ace_type = header.Header.AceType;
+        let mask = header.Mask;
+        // Only a plain allow ACE carries a trustee this policy can evaluate; the
+        // policy rejects other allow types that hold dangerous bits.
+        let needs_sid = ace_type == service_acl::ACCESS_ALLOWED_ACE_TYPE
+            && mask & service_acl::DANGEROUS_ACCESS != 0;
+        let sid = if needs_sid {
+            let sid_offset = std::mem::offset_of!(ACCESS_ALLOWED_ACE, SidStart);
+            // SAFETY: for an ACCESS_ALLOWED_ACE the SID begins at SidStart and
+            // lies inside the ACE block that `GetAce` returned.
+            let sid = PSID(unsafe { (ace as *mut u8).add(sid_offset) } as *mut c_void);
+            unsafe { sid_to_string(sid) }
+        } else {
+            None
+        };
+        entries.push(AceEntry { ace_type, mask, sid });
+    }
+    drop(descriptor);
+
+    match service_acl::evaluate(owner_sid.as_deref(), &entries) {
+        Ok(()) => Ok(true),
+        Err(reason) => {
             tracing::warn!(
                 target: "bosphorus::service",
                 path = %path.display(),
-                sid = %text,
-                mask = format_args!("{:#x}", allowed.Mask),
-                "install directory grants ordinary users write/delete rights"
+                reason = %reason.describe(),
+                "install directory rejected by ACL policy"
             );
-            drop(descriptor);
-            return Ok(false);
+            Ok(false)
         }
     }
-    drop(descriptor);
-    Ok(true)
 }
 
 #[cfg(not(windows))]

@@ -1,5 +1,5 @@
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -74,24 +74,28 @@ const EVICT_EVERY: Duration = Duration::from_secs(60);
 pub type NetKeyFn = Arc<dyn Fn() -> (String, String) + Send + Sync>;
 
 /// Run one packet behind an unwind boundary. On panic the partial send batch is
-/// discarded, the original bytes/metadata are restored, and the caller forwards
-/// the untouched packet. Returning the panic flag lets the loop log it.
+/// discarded and the caller forwards the captured packet unchanged.
+///
+/// The packet and its metadata are passed by shared reference because
+/// [`Engine::process`] never writes to them: every transform builds its packets
+/// into the batch. That makes the "forward the untouched packet" recovery true by
+/// construction, and keeps the hot path free of a per-packet heap copy of up to
+/// `MAX_CAPTURE` bytes. A future transform that wants to mutate in place has to
+/// change this signature, which is the point: the copy cannot quietly disappear
+/// while mutation is reintroduced.
 fn guarded_process<F>(
-    data: &mut [u8],
-    meta: &mut CaptureMeta,
+    data: &[u8],
+    meta: &CaptureMeta,
     batch: &mut SendBatch,
     process: F,
 ) -> (Decision, bool)
 where
-    F: FnOnce(&mut [u8], &mut CaptureMeta, &mut SendBatch) -> Decision,
+    F: FnOnce(&[u8], &CaptureMeta, &mut SendBatch) -> Decision,
 {
-    let original_bytes = data.to_vec();
-    let original_meta = *meta;
     match catch_unwind(AssertUnwindSafe(|| process(data, meta, batch))) {
         Ok(decision) => (decision, false),
         Err(_) => {
-            data.copy_from_slice(&original_bytes);
-            *meta = original_meta;
+            // Only the staged packets belong to this attempt; drop them all.
             batch.items.clear();
             (Decision::ForwardOriginal, true)
         }
@@ -167,6 +171,10 @@ pub struct Engine {
     /// JSON byte count of the last profile write (0 until the first write, or
     /// in a forced / no-profile run). Read by the `bosphorus::mem` digest.
     last_profile_bytes: AtomicUsize,
+    /// Sequence number of the next profile snapshot. Taken *before* a snapshot
+    /// is exported so a slow writer holding an older snapshot cannot land after
+    /// a newer one (see `persist::save_snapshot`).
+    profile_seq: AtomicU64,
 
     // --- live network re-keying (only populated by `with_live_netkey`) ---
     /// `None` = no live re-keying; `maybe_rebind` is then a no-op.
@@ -211,6 +219,7 @@ impl Engine {
             mem_at: Mutex::new(now),
             evict_at: Mutex::new(now),
             last_profile_bytes: AtomicUsize::new(0),
+            profile_seq: AtomicU64::new(0),
             netkey_provider: None,
             netkey_dirty: AtomicBool::new(false),
             netkey_changed_at: Mutex::new(now),
@@ -301,8 +310,8 @@ impl Engine {
     /// Per-packet decision: feed conntrack, feed/act on discovery, decide.
     pub fn process(
         &self,
-        packet: &mut [u8],
-        meta: &mut CaptureMeta,
+        packet: &[u8],
+        meta: &CaptureMeta,
         out: &mut SendBatch,
     ) -> Decision {
         if meta.impostor {
@@ -382,7 +391,7 @@ impl Engine {
         discovery: &Discovery,
         key: &FlowKey,
         view: &PacketView<'_>,
-        meta: &mut CaptureMeta,
+        meta: &CaptureMeta,
         out: &mut SendBatch,
         now: Instant,
     ) -> Decision {
@@ -599,10 +608,10 @@ impl Engine {
             stats.packets += 1;
             stats.bytes += captured.data.len() as u64;
 
-            let mut meta = captured.meta;
+            let meta = captured.meta;
             let mut batch = SendBatch::new();
             let (decision, panicked) =
-                guarded_process(captured.data, &mut meta, &mut batch, |data, meta, batch| {
+                guarded_process(captured.data, &meta, &mut batch, |data, meta, batch| {
                     self.process(data, meta, batch)
                 });
             if panicked {
@@ -758,16 +767,10 @@ impl Engine {
     fn rebind(&self, new_key: &str, new_human: &str, now: Instant) {
         let old = self.session.load_full();
 
-        // 1. flush the old network's learned state to its OWN file.
+        // 1. flush the old network's learned state to its OWN file, through the
+        //    same sequenced writer the tick thread and shutdown use.
         if let Some(p) = &old.profile {
-            let file = old.discovery.export(&p.net_key);
-            match crate::profile::persist::save(&p.dir, &p.net_key, &file) {
-                Ok(n) => self.last_profile_bytes.store(n, Ordering::Relaxed),
-                Err(e) => tracing::warn!(
-                    target: "bosphorus::net", error = %e,
-                    "old-profile flush failed on rebind"
-                ),
-            }
+            self.write_profile(&old.discovery, p);
         }
 
         // 2. resolve where the new profile lives. `nonet` (or no dir anywhere)
@@ -878,16 +881,28 @@ impl Engine {
         }
     }
 
+    /// Export and commit the current profile.
+    ///
+    /// The sequence is taken *before* the export, so two writers cannot invert:
+    /// whichever snapshot is older loses even if its rename completes last. This
+    /// is what makes the shutdown flush authoritative over a tick-thread write
+    /// that was already in flight.
     fn write_profile(&self, discovery: &Discovery, p: &ProfilePaths) {
+        let seq = self.profile_seq.fetch_add(1, Ordering::SeqCst) + 1;
         let file = discovery.export(&p.net_key);
-        match crate::profile::persist::save(&p.dir, &p.net_key, &file) {
-            Ok(n) => {
+        match crate::profile::persist::save_snapshot(&p.dir, &p.net_key, &file, seq) {
+            Ok(Some(n)) => {
                 self.last_profile_bytes.store(n, Ordering::Relaxed);
                 tracing::debug!(
                     target: "bosphorus::discovery",
-                    targets = file.targets.len(), bytes = n, "discovery profile saved"
+                    targets = file.targets.len(), bytes = n, seq, "discovery profile saved"
                 )
             }
+            Ok(None) => tracing::debug!(
+                target: "bosphorus::discovery",
+                seq,
+                "stale discovery profile snapshot discarded; a newer one is already on disk"
+            ),
             Err(e) => tracing::warn!(
                 target: "bosphorus::discovery", error = %e, "discovery profile save failed"
             ),
@@ -2061,21 +2076,51 @@ mod tests {
         );
     }
 
+    // --- shutdown vs. periodic writer ------------------------------------
+
+    /// Regression: the tick thread used to keep running (and writing) after
+    /// `persist_now` took the shutdown snapshot. A tick that had already
+    /// exported its older snapshot could rename it over the final flush. The
+    /// engine now sequences every snapshot before exporting it, and
+    /// `persist::save_snapshot` refuses one that is not newer than what is on
+    /// disk, so a late worker cannot roll the profile back.
+    #[test]
+    fn a_stale_tick_snapshot_cannot_undo_the_shutdown_flush() {
+        let dir = tempfile::tempdir().unwrap();
+        let (engine, _key) = live_engine(dir.path(), "keyA");
+        engine.persist_now();
+        let path = crate::profile::persist::profile_path(dir.path(), "keyA");
+        let flushed = std::fs::read(&path).expect("shutdown flush wrote the profile");
+
+        // The shutdown write is the engine's first snapshot (sequence 1). A tick
+        // that exported before it is therefore not newer and must be discarded.
+        let stale = crate::profile::persist::ProfileFile::new(0, "keyA", Vec::new());
+        assert!(
+            crate::profile::persist::save_snapshot(dir.path(), "keyA", &stale, 1)
+                .unwrap()
+                .is_none(),
+            "a snapshot that is not newer than the flushed state must not be written"
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            flushed,
+            "the shutdown snapshot must still be the one on disk"
+        );
+    }
+
     // --- per-packet panic boundary ----------------------------------------
 
     #[test]
     fn a_panicking_packet_discards_its_partial_batch_and_forwards_the_original() {
-        let mut data = clienthello_pkt();
+        let data = clienthello_pkt();
         let original = data.clone();
-        let mut meta = out_meta();
+        let meta = out_meta();
         let mut batch = SendBatch::new();
-        let (decision, panicked) =
-            guarded_process(&mut data, &mut meta, &mut batch, |data, meta, batch| {
-                data[0] = 0xff; // a half-applied mutation
-                meta.outbound = false;
-                batch.push(vec![0xde, 0xad], out_meta());
-                panic!("simulated packet-transform bug");
-            });
+        let (decision, panicked) = guarded_process(&data, &meta, &mut batch, |_, _, batch| {
+            batch.push(vec![0xde, 0xad], out_meta());
+            batch.push(vec![0xbe, 0xef], out_meta());
+            panic!("simulated packet-transform bug");
+        });
 
         assert!(panicked, "the unwind must be caught at the packet boundary");
         assert_eq!(decision, Decision::ForwardOriginal);
@@ -2083,11 +2128,45 @@ mod tests {
             batch.items.is_empty(),
             "partial packets must never be injected"
         );
+        assert_eq!(data, original, "the captured packet is forwarded unchanged");
+    }
+
+    /// Regression: the boundary used to copy every captured packet
+    /// (`data.to_vec()`) so it could "restore" it. `process` never mutates the
+    /// packet, so the copy was pure per-packet allocation on the hot path (up to
+    /// `MAX_CAPTURE` bytes every packet). The captured buffer must now be the
+    /// same allocation before and after a panicking call.
+    #[test]
+    fn the_panic_boundary_does_not_copy_the_captured_packet() {
+        let data = clienthello_pkt();
+        let before = data.as_ptr();
+        let meta = out_meta();
+        let mut batch = SendBatch::new();
+        let (_, panicked) = guarded_process(&data, &meta, &mut batch, |_, _, _| {
+            panic!("simulated packet-transform bug")
+        });
+        assert!(panicked);
         assert_eq!(
-            data, original,
-            "the original packet is restored before forwarding"
+            data.as_ptr(),
+            before,
+            "the hot path must not reallocate the capture buffer"
         );
-        assert!(meta.outbound, "the original metadata is restored too");
+    }
+
+    /// A successful call still returns its batch decision; only the panic path
+    /// rewrites the decision to `ForwardOriginal`.
+    #[test]
+    fn a_panicking_call_never_returns_a_batch_decision() {
+        let data = clienthello_pkt();
+        let meta = out_meta();
+        let mut batch = SendBatch::new();
+        let (decision, panicked) = guarded_process(&data, &meta, &mut batch, |_, _, batch| {
+            batch.push(vec![0x01], out_meta());
+            Decision::ForwardBatchOnly
+        });
+        assert!(!panicked);
+        assert_eq!(decision, Decision::ForwardBatchOnly);
+        assert_eq!(batch.items.len(), 1);
     }
 
     #[test]

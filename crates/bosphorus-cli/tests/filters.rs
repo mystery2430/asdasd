@@ -44,6 +44,17 @@ fn the_selective_quic_clause_is_present_and_version_agnostic() {
         !s.contains("udp.Payload32[1b]"),
         "pinning the version would miss QUIC v2 and the drafts"
     );
+    // Long-header form bit only. `>= 0xC0` also required the fixed bit, which
+    // RFC 9287 allows endpoints to grease to zero, so greased Initials were
+    // never captured: the engine could not classify (and refuse) them.
+    assert!(
+        s.contains("udp.Payload[0] >= 0x80"),
+        "QUIC gate must accept every long header: {s}"
+    );
+    assert!(
+        !s.contains("udp.Payload[0] >= 0xC0"),
+        "the greasable fixed bit must not gate capture: {s}"
+    );
     assert!(
         f.quic_drop.is_none(),
         "selective mode must not also blanket-drop"

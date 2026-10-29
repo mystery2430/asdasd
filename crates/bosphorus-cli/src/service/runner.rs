@@ -169,7 +169,10 @@ fn run_service(arguments: Vec<OsString>) -> anyhow::Result<()> {
         &format!("service started — capture active (net {human})"),
     );
 
-    {
+    // Handle retained so the service can join the periodic worker before its
+    // final flush; a tick still inside `maybe_persist` could otherwise commit an
+    // older snapshot after the shutdown write.
+    let tick_thread = {
         let engine = Arc::clone(&engine);
         let stop = Arc::clone(&stop);
         std::thread::spawn(move || {
@@ -177,8 +180,8 @@ fn run_service(arguments: Vec<OsString>) -> anyhow::Result<()> {
                 engine.tick(Instant::now());
                 std::thread::sleep(Duration::from_millis(500));
             }
-        });
-    }
+        })
+    };
 
     // Route notifications are the normal path. If registration fails, keep the
     // failure visible in the Event Log and arm a cheap periodic NetKey poll so
@@ -218,7 +221,11 @@ fn run_service(arguments: Vec<OsString>) -> anyhow::Result<()> {
     };
     let run = engine.run_main(&mut src, &mut sink, &stop);
 
+    // SCM already signalled stop during `run_main`; make it explicit for the
+    // worker, join it, then flush. Nothing may write the profile afterwards.
+    stop.stop();
     drop(_netwatch);
+    let _ = tick_thread.join();
     engine.persist_now();
     if let Err(e) = run {
         eventlog::warn(

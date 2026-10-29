@@ -125,6 +125,16 @@ fn unique_tag() -> String {
     )
 }
 
+/// Highest snapshot sequence committed per profile path in this process.
+///
+/// A profile writer exports a snapshot, then serializes and renames it. Without
+/// an ordering guard a slow writer holding an *older* snapshot can land after a
+/// newer one and silently roll the profile back. Every write therefore carries a
+/// sequence assigned before the snapshot is taken, and a write is skipped when a
+/// higher sequence has already been committed for that path. The last bytes on
+/// disk are always those of the newest snapshot this process produced.
+static LAST_COMMITTED: Mutex<Vec<(PathBuf, u64)>> = Mutex::new(Vec::new());
+
 /// Write `bytes` to `path` atomically: a unique staging file, then a
 /// last-writer-wins rename. The target is never left torn, concurrent writers in
 /// one process cannot share a temp, and a failed write removes its staging file.
@@ -135,6 +145,12 @@ pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
 
 fn atomic_write_with_tag(path: &Path, bytes: &[u8], tag: &str) -> io::Result<()> {
     let _guard = write_lock(path).lock();
+    stage_and_rename(path, bytes, tag)
+}
+
+/// Stage + rename without taking [`write_lock`]; callers that already hold it
+/// (or need the lock across serialization) use this directly.
+fn stage_and_rename(path: &Path, bytes: &[u8], tag: &str) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -150,6 +166,38 @@ fn atomic_write_with_tag(path: &Path, bytes: &[u8], tag: &str) -> io::Result<()>
         return Err(e);
     }
     Ok(())
+}
+
+/// Versioned atomic write: commit `file` only if `seq` is newer than the last
+/// snapshot committed for this path.
+///
+/// `seq` must be assigned *before* the snapshot is exported, and must increase
+/// per writer. Returns `Ok(None)` when the write was discarded because a newer
+/// snapshot is already on disk. Serialization happens under the per-path lock so
+/// two writers cannot interleave a stale export with a fresh rename.
+pub fn save_snapshot(
+    dir: &Path,
+    net_key: &str,
+    file: &ProfileFile,
+    seq: u64,
+) -> io::Result<Option<usize>> {
+    let path = profile_path(dir, net_key);
+    let _guard = write_lock(&path).lock();
+
+    let mut committed = LAST_COMMITTED.lock();
+    if committed
+        .iter()
+        .any(|(seen_path, seen_seq)| seen_path == &path && *seen_seq >= seq)
+    {
+        return Ok(None);
+    }
+    let json = serde_json::to_vec_pretty(file).map_err(io::Error::other)?;
+    stage_and_rename(&path, &json, &unique_tag())?;
+    match committed.iter_mut().find(|(seen_path, _)| seen_path == &path) {
+        Some(entry) => entry.1 = seq,
+        None => committed.push((path, seq)),
+    }
+    Ok(Some(json.len()))
 }
 
 /// Read `<dir>/<net_key>.json`. `None` if it does not exist or cannot be
@@ -355,5 +403,78 @@ mod tests {
         assert_eq!(back.targets.len(), 1);
         assert_eq!(back.targets[0].key, "b.example", "last writer wins");
         assert!(tmp_files(dir.path()).is_empty(), "no temp litter");
+    }
+
+    #[test]
+    fn a_stale_snapshot_cannot_overwrite_a_newer_one() {
+        // Regression: the periodic tick thread and the shutdown flush both write
+        // the profile. A worker that exported its snapshot first must not land
+        // last and roll the file back.
+        let dir = tempfile::tempdir().unwrap();
+        let key = "net";
+
+        let mut fresh = sample();
+        fresh.targets[0].key = "fresh.example".into();
+        fresh.targets[0].consecutive_failure = 7;
+        assert_eq!(
+            save_snapshot(dir.path(), key, &fresh, 2).unwrap(),
+            Some(serde_json::to_vec_pretty(&fresh).unwrap().len())
+        );
+
+        let mut stale = sample();
+        stale.targets[0].key = "stale.example".into();
+        stale.targets[0].consecutive_failure = 1;
+        assert!(
+            save_snapshot(dir.path(), key, &stale, 1).unwrap().is_none(),
+            "an older snapshot must be discarded"
+        );
+
+        let back = load(dir.path(), key).unwrap();
+        assert_eq!(back.targets[0].key, "fresh.example");
+        assert_eq!(back.targets[0].consecutive_failure, 7);
+        assert!(tmp_files(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn out_of_order_writers_always_leave_the_highest_snapshot() {
+        // Many writers race; completion order is arbitrary. Whatever the order,
+        // the file must end on the highest sequence, which is the newest state.
+        let dir = tempfile::tempdir().unwrap();
+        let key = "net";
+        let mut handles = Vec::new();
+        for seq in 1u64..=32 {
+            let dir = dir.path().to_path_buf();
+            handles.push(std::thread::spawn(move || {
+                let mut file = sample();
+                file.targets[0].key = format!("writer-{seq}.example");
+                file.targets[0].consecutive_failure = seq as u8;
+                save_snapshot(&dir, key, &file, seq).unwrap();
+            }));
+        }
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        let back = load(dir.path(), key).expect("final file is valid JSON");
+        assert_eq!(back.targets[0].key, "writer-32.example");
+        assert_eq!(back.targets[0].consecutive_failure, 32);
+        assert!(tmp_files(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn an_equal_sequence_is_not_rewritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = "net";
+        let mut first = sample();
+        first.targets[0].key = "first.example".into();
+        assert!(save_snapshot(dir.path(), key, &first, 5).unwrap().is_some());
+
+        let mut second = sample();
+        second.targets[0].key = "second.example".into();
+        assert!(save_snapshot(dir.path(), key, &second, 5).unwrap().is_none());
+        assert_eq!(
+            load(dir.path(), key).unwrap().targets[0].key,
+            "first.example"
+        );
     }
 }

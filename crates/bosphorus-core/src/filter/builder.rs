@@ -30,6 +30,13 @@ fn port_clause(ports: &[u16], field: &str) -> String {
 pub fn build(cfg: &EvasionConfig) -> Result<Filters, CoreError> {
     let maxpayload = t::MAXPAYLOAD_FMT.replace("{n}", &cfg.max_payload_filter.to_string());
     let ports = cfg.effective_tls_ports();
+    // One source of truth with the packet parser: the coarse gate is the QUIC
+    // long-header form bit. Requiring the fixed bit too (`0xC0`) missed long
+    // headers whose fixed bit is greased to zero (RFC 9287).
+    let min_first_byte = format!(
+        "{:#04X}",
+        crate::packet::quic::LONG_HEADER_FIRST_BYTE_MIN
+    );
 
     // Inbound verdict clause: SYN-ACK (passive TTL, M7), RST (DpiReset), and the
     // first data segment of a TLS response — `Payload[0] == 0x16` confirmed in
@@ -62,7 +69,8 @@ pub fn build(cfg: &EvasionConfig) -> Result<Filters, CoreError> {
             &t::QUIC_SELECTIVE_FMT
                 .replace("{dst_ports}", &port_clause(ports, "udp.DstPort"))
                 .replace("{v4dst}", t::NO_LOCALNETS_V4_DST)
-                .replace("{v6dst}", t::NO_LOCALNETS_V6_DST),
+                .replace("{v6dst}", t::NO_LOCALNETS_V6_DST)
+                .replace("{min_first_byte}", &min_first_byte),
         );
     }
     if cfg.dns_upstream.is_some() {
@@ -77,10 +85,8 @@ pub fn build(cfg: &EvasionConfig) -> Result<Filters, CoreError> {
     let main =
         CString::new(main).map_err(|_| CoreError::Filter("main filter has interior NUL".into()))?;
     let quic_drop = if cfg.quic.wants_blanket_drop() {
-        Some(
-            CString::new(t::QUIC_DROP)
-                .map_err(|_| CoreError::Filter("quic filter has interior NUL".into()))?,
-        )
+        let filter = t::QUIC_DROP.replace("{min_first_byte}", &min_first_byte);
+        Some(CString::new(filter).map_err(|_| CoreError::Filter("quic filter has interior NUL".into()))?)
     } else {
         None
     };
@@ -132,7 +138,15 @@ mod tests {
             .unwrap();
         assert!(s.contains("udp.DstPort == 443"));
         assert!(s.contains("udp.PayloadLength >= 1200"));
-        assert!(s.contains("udp.Payload[0] >= 0xC0"));
+        let gate = format!(
+            "udp.Payload[0] >= {:#04X}",
+            crate::packet::quic::LONG_HEADER_FIRST_BYTE_MIN
+        );
+        assert!(s.contains(&gate), "selective gate missing {gate}: {s}");
+        assert!(
+            !s.contains("udp.Payload[0] >= 0xC0"),
+            "the gate must not require the greasable fixed bit: {s}"
+        );
         assert!(
             !s.contains("udp.Payload32[1b]"),
             "the version pin would miss QUIC v2 and the drafts"
@@ -161,11 +175,25 @@ mod tests {
         let f = build(&cfg).unwrap();
         assert!(!f.main.to_str().unwrap().contains("udp"));
         let drop_filter = f.quic_drop.unwrap().into_string().unwrap();
-        assert_eq!(drop_filter, t::QUIC_DROP);
         // The v1-only version field must not reappear: it misses v2 and drafts.
         assert!(!drop_filter.contains("Payload32[1b]"), "{drop_filter}");
-        assert!(drop_filter.contains("udp.Payload[0] >= 0xC0"));
         assert!(drop_filter.contains("udp.PayloadLength >= 1200"));
+        // The gate is the long-header form bit alone (0x80), shared with the
+        // packet parser. `0xC0` also required the fixed bit, which RFC 9287 lets
+        // endpoints grease to zero, so those Initials escaped the blanket drop.
+        let gate = format!(
+            "udp.Payload[0] >= {:#04X}",
+            crate::packet::quic::LONG_HEADER_FIRST_BYTE_MIN
+        );
+        assert!(drop_filter.contains(&gate), "drop gate missing {gate}: {drop_filter}");
+        assert!(!drop_filter.contains("0xC0"), "fixed bit must not be required: {drop_filter}");
+        assert_eq!(
+            drop_filter,
+            t::QUIC_DROP.replace(
+                "{min_first_byte}",
+                &format!("{:#04X}", crate::packet::quic::LONG_HEADER_FIRST_BYTE_MIN)
+            )
+        );
     }
 
     #[test]
