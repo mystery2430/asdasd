@@ -999,6 +999,11 @@ mod tests {
         let root = TempDir::new("grandparent");
         let grandparent = root.path().join("gp");
         let target = grandparent.join("parent").join("Bosphorus");
+        // `prepare_install_dir` creates the chain, but this test needs the
+        // grandparent's canonical spelling *first* (it decides what the probe
+        // rejects), so create it up front instead of canonicalizing a path that
+        // does not exist yet.
+        std::fs::create_dir_all(&grandparent).unwrap();
         let canonical_gp = grandparent.canonicalize().unwrap();
 
         let probed = std::cell::RefCell::new(Vec::new());
@@ -1090,6 +1095,61 @@ mod tests {
         let dir = TempDir::new("admin-chain");
         let target = dir.path().join("Bosphorus");
         prepare_install_dir(&target, |_| Ok(true)).expect("administrator chain accepted");
+    }
+
+    /// The legitimate path, with **real** Windows security descriptors: a
+    /// directory created under `%ProgramFiles%` on an elevated runner must be
+    /// accepted, together with every ancestor the installer walks.
+    ///
+    /// `%ProgramFiles%` is owned by TrustedInstaller (or Administrators) and its
+    /// DACL carries the `CREATOR OWNER` placeholder plus read-only `Users`/
+    /// `ALL APPLICATION PACKAGES` entries. If the policy were too strict, this is
+    /// the test that would catch a normal install being refused.
+    #[cfg(windows)]
+    #[test]
+    fn a_real_program_files_directory_is_accepted() {
+        let Some(pf) = std::env::var_os("ProgramFiles") else {
+            eprintln!("ProgramFiles is not set; skipping the real-descriptor test");
+            return;
+        };
+        let dir = PathBuf::from(pf).join(format!("Bosphorus-acl-{}", std::process::id()));
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            // A non-elevated runner cannot create this; say so instead of passing
+            // silently.
+            eprintln!("cannot create {} ({e}); skipping", dir.display());
+            return;
+        }
+
+        let verdict = directory_is_safe(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            verdict.expect("GetNamedSecurityInfo must succeed on a real directory"),
+            "a stock %ProgramFiles% directory must be accepted as an install location"
+        );
+    }
+
+    /// The unsafe path, with **real** Windows security descriptors: a directory
+    /// in the current user's profile is owned by that user SID, not by an
+    /// administrator group, so it must be refused even when the account happens
+    /// to be a member of Administrators (as on CI runners).
+    #[cfg(windows)]
+    #[test]
+    fn a_real_user_profile_directory_is_refused() {
+        let Some(home) = std::env::var_os("USERPROFILE") else {
+            eprintln!("USERPROFILE is not set; skipping the real-descriptor test");
+            return;
+        };
+        let dir = PathBuf::from(home).join(format!("bosphorus-acl-{}", std::process::id()));
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            eprintln!("cannot create {} ({e}); skipping", dir.display());
+            return;
+        }
+        let verdict = directory_is_safe(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            !verdict.expect("GetNamedSecurityInfo must succeed on a real directory"),
+            "a profile directory owned by an individual account must be refused"
+        );
     }
 
     /// Non-Windows runs must not skip the guard silently in a way that changes
