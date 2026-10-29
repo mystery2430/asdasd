@@ -654,6 +654,10 @@ fn directory_is_safe(path: &Path) -> std::io::Result<bool> {
         // object and callback ACEs.
         let header = unsafe { &*(ace as *const ACCESS_ALLOWED_ACE) };
         let ace_type = header.Header.AceType;
+        // `AceFlags` is only needed to keep the entry faithful; the policy's
+        // placeholder rule is documented in `service_acl` and does not depend on
+        // an untrusted trustee being inherit-only.
+        let ace_flags = header.Header.AceFlags;
         let mask = header.Mask;
         // Only a plain allow ACE carries a trustee this policy can evaluate; the
         // policy rejects other allow types that hold dangerous bits.
@@ -670,6 +674,7 @@ fn directory_is_safe(path: &Path) -> std::io::Result<bool> {
         };
         entries.push(AceEntry {
             ace_type,
+            ace_flags,
             mask,
             sid,
         });

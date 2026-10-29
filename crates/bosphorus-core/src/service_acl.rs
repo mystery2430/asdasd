@@ -21,9 +21,18 @@
 //! `WRITE_DAC`, so a non-administrator owner can rewrite the DACL and grant
 //! itself write access; that condition is checked too.
 //!
-//! Not established here: SACL/auditing, integrity levels, parent-directory
-//! ACLs, and TOCTOU between this check and the file copy. This is one gate in
-//! the installer, not a proof that the directory stays administrator-only.
+//! Windows' default `C:\Program Files` DACL contains inherited `CREATOR OWNER`
+//! entries. They are placeholder SIDs that resolve, at access-check time, to the
+//! owner of the object the ACE was inherited *by* — never to an arbitrary
+//! principal. Because the installer requires the owner of both the directory and
+//! its parent to be an administrator, such an entry can only ever grant
+//! administrator principals and is therefore accepted. Every other untrusted
+//! trustee, including one carrying inherit-only flags, still rejects.
+//!
+//! Not established here: SACL/auditing, integrity levels, whether the parent
+//! chain above the immediate parent is sound, and TOCTOU between this check and
+//! the file copy. This is one gate in the installer, not a proof that the
+//! directory stays administrator-only.
 
 /// `ACCESS_ALLOWED_ACE_TYPE` — a plain allow ACE whose trustee is a SID.
 pub const ACCESS_ALLOWED_ACE_TYPE: u8 = 0x00;
@@ -61,11 +70,33 @@ pub const TRUSTED_SID_ALLOWLIST: [&str; 3] = [
     "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464",
 ];
 
+/// `ACE_HEADER::AceFlags` bits the policy cares about.
+pub mod ace_flags {
+    /// Applies to the object itself.
+    pub const EFFECTIVE: u8 = 0x00;
+    /// Inherited by child containers.
+    pub const CONTAINER_INHERIT: u8 = 0x02;
+    /// Inherited by child objects.
+    pub const OBJECT_INHERIT: u8 = 0x01;
+    /// Only inherited by children; grants nothing on this object.
+    pub const INHERIT_ONLY: u8 = 0x08;
+    /// Set by Windows on ACEs the object inherited rather than carries itself.
+    pub const INHERITED: u8 = 0x10;
+}
+
+/// Placeholder trustees whose meaning is "the owner of the object", resolved by
+/// the kernel at access-check time. See the module docs for why accepting them
+/// does not weaken the owner requirement.
+const CREATOR_OWNER_SID: &str = "S-1-3-0";
+const OWNER_RIGHTS_SID: &str = "S-1-3-4";
+
 /// One DACL entry, as much of it as the policy needs.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AceEntry {
     /// `ACE_HEADER::AceType`.
     pub ace_type: u8,
+    /// `ACE_HEADER::AceFlags` (see [`ace_flags`]).
+    pub ace_flags: u8,
     /// The access mask (`ACCESS_ALLOWED_ACE::Mask`; the first eight bytes of the
     /// ACE are laid out the same way for object and callback allow ACEs).
     pub mask: u32,
@@ -75,14 +106,33 @@ pub struct AceEntry {
 }
 
 impl AceEntry {
-    /// A plain allow ACE for `sid` with `mask`.
+    /// A plain allow ACE for `sid` with `mask`, applying to the object itself.
     pub fn allow(mask: u32, sid: &str) -> Self {
         Self {
             ace_type: ACCESS_ALLOWED_ACE_TYPE,
+            ace_flags: ace_flags::EFFECTIVE,
             mask,
             sid: Some(sid.to_owned()),
         }
     }
+
+    /// An inheritable allow ACE, as Windows records it on the parent.
+    pub fn allow_inherited(mask: u32, sid: &str) -> Self {
+        Self {
+            ace_type: ACCESS_ALLOWED_ACE_TYPE,
+            ace_flags: ace_flags::OBJECT_INHERIT
+                | ace_flags::CONTAINER_INHERIT
+                | ace_flags::INHERIT_ONLY
+                | ace_flags::INHERITED,
+            mask,
+            sid: Some(sid.to_owned()),
+        }
+    }
+}
+
+/// Whether this trustee only ever resolves to the object's owner.
+fn is_owner_scoped_placeholder(sid: &str) -> bool {
+    sid.eq_ignore_ascii_case(CREATOR_OWNER_SID) || sid.eq_ignore_ascii_case(OWNER_RIGHTS_SID)
 }
 
 /// Why a directory must not host the service.
@@ -171,6 +221,9 @@ pub fn evaluate(owner_sid: Option<&str>, aces: &[AceEntry]) -> Result<(), AclRej
         }
         match ace.sid.as_deref() {
             Some(sid) if is_trusted(sid) => continue,
+            // Resolves to the object's owner, which must already be an
+            // administrator, so it cannot grant an ordinary principal anything.
+            Some(sid) if is_owner_scoped_placeholder(sid) => continue,
             Some(sid) => {
                 return Err(AclRejection::UntrustedWriteAce {
                     sid: sid.to_owned(),
@@ -274,6 +327,7 @@ mod tests {
     fn an_unresolvable_trustee_on_a_write_ace_fails_closed() {
         let entry = AceEntry {
             ace_type: ACCESS_ALLOWED_ACE_TYPE,
+            ace_flags: ace_flags::EFFECTIVE,
             mask: 0x0000_0002,
             sid: None,
         };
@@ -295,6 +349,7 @@ mod tests {
         ] {
             let entry = AceEntry {
                 ace_type,
+                ace_flags: ace_flags::EFFECTIVE,
                 mask: 0x4000_0000,
                 sid: Some(ADMIN.to_owned()),
             };
@@ -313,16 +368,68 @@ mod tests {
         let aces = [
             AceEntry {
                 ace_type: ACCESS_DENIED_ACE_TYPE,
+                ace_flags: ace_flags::EFFECTIVE,
                 mask: 0x001F_01FF,
                 sid: Some(ALICE.to_owned()),
             },
             AceEntry {
                 ace_type: 0x02, // ACCESS_SYSTEM_AUDIT_ACE_TYPE
+                ace_flags: ace_flags::EFFECTIVE,
                 mask: 0x001F_01FF,
                 sid: Some(USERS.to_owned()),
             },
         ];
         assert_eq!(evaluate(Some(ADMIN), &aces), Ok(()));
+    }
+
+    /// A stock `C:\Program Files` DACL carries inherited `CREATOR OWNER` full
+    /// control. Rejecting it would refuse every legitimate elevated install, so
+    /// the placeholder is accepted — and it can only ever resolve to the owner,
+    /// which the policy already requires to be an administrator.
+    #[test]
+    fn a_program_files_style_dacl_with_creator_owner_is_accepted() {
+        let aces = [
+            AceEntry::allow(0x001F_01FF, SYSTEM),
+            AceEntry::allow(0x001F_01FF, ADMIN),
+            AceEntry::allow_inherited(0x001F_01FF, CREATOR_OWNER_SID),
+            AceEntry::allow_inherited(0x0012_00A9, USERS),
+            AceEntry::allow_inherited(0x0012_00A9, "S-1-15-2-1"),
+        ];
+        assert_eq!(
+            evaluate(
+                Some("S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464"),
+                &aces
+            ),
+            Ok(())
+        );
+        assert_eq!(evaluate(Some(ADMIN), &aces), Ok(()));
+        // A placeholder never rescues a directory owned by an ordinary user.
+        assert_eq!(
+            evaluate(Some(ALICE), &aces),
+            Err(AclRejection::UntrustedOwner(ALICE.to_owned()))
+        );
+    }
+
+    /// The placeholder exemption must not extend to real users: an inherited
+    /// ACE for an individual account still rejects, flags or not.
+    #[test]
+    fn an_inherited_allow_ace_for_a_real_user_is_still_rejected() {
+        for entry in [
+            AceEntry::allow_inherited(0x001F_01FF, ALICE),
+            AceEntry::allow_inherited(0x001F_01FF, AUTH_USERS),
+            AceEntry::allow(0x4000_0000, OWNER_RIGHTS_SID),
+        ] {
+            let sid = entry.sid.clone();
+            let result = evaluate(Some(ADMIN), &[entry]);
+            match sid.as_deref() {
+                // OWNER RIGHTS is owner-scoped, so that one case must pass.
+                Some(sid) if is_owner_scoped_placeholder(sid) => assert_eq!(result, Ok(())),
+                _ => assert!(matches!(
+                    result,
+                    Err(AclRejection::UntrustedWriteAce { .. })
+                )),
+            }
+        }
     }
 
     #[test]
