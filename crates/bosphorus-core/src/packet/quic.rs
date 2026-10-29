@@ -43,20 +43,41 @@ pub struct LongHeader {
 /// Per RFC 9000 §17.2, a connection ID is at most 20 bytes.
 const MAX_CID_LEN: u8 = 20;
 
+/// Lowest first byte of a QUIC long header: the header-form bit, `0x80`.
+///
+/// This is the coarse gate the WinDivert filters use
+/// (`udp.Payload[0] >= 0x80`, rendered from this constant). It must **not** also
+/// require the fixed bit (`0x40`): RFC 9287 lets endpoints negotiate greasing the
+/// fixed bit to zero, and a greased Initial still opens a connection. A `0xC0`
+/// threshold silently missed every such datagram — it was both never captured for
+/// [`QuicPolicy::Blocked`](crate::config::QuicPolicy::Blocked) and never dropped
+/// for [`QuicPolicy::All`](crate::config::QuicPolicy::All).
+pub const LONG_HEADER_FIRST_BYTE_MIN: u8 = 0x80;
+
+/// The capture-filter predicate: does this first byte announce a long header?
+///
+/// Kept next to the parser so a filter change and a parser change cannot drift
+/// apart: [`parse_long_header`] accepts exactly the payloads this gate lets
+/// through (`tests::the_gate_matches_the_parser_for_every_first_byte`).
+pub fn is_long_header_candidate(first_byte: u8) -> bool {
+    first_byte >= LONG_HEADER_FIRST_BYTE_MIN
+}
+
 /// Parse a QUIC long header out of a UDP payload. `None` for a short header,
 /// a datagram too small to hold a header, or a malformed connection-ID length.
 ///
 /// The fixed bit (`0x40`) is deliberately not required: RFC 9287 lets an
 /// endpoint negotiate greasing it to zero, and a greased Initial still opens a
-/// connection. The capture filter's coarse `>= 0xC0` match is the gate that
-/// keeps the volume down; this parser stays permissive behind it.
+/// connection. The capture filter's coarse `>= 0x80` match
+/// ([`LONG_HEADER_FIRST_BYTE_MIN`]) is the gate that keeps the volume down; this
+/// parser is the precise second stage behind it.
 pub fn parse_long_header(payload: &[u8]) -> Option<LongHeader> {
     // 1 flags + 4 version + 1 DCID length is the shortest possible prefix.
     if payload.len() < 6 {
         return None;
     }
     let first = payload[0];
-    if first & 0x80 == 0 {
+    if !is_long_header_candidate(first) {
         return None; // short header — an established connection, not an attempt
     }
 
@@ -217,5 +238,61 @@ mod tests {
         p.push(8);
         p.extend_from_slice(&[0xab; 8]); // DCID present, SCID length byte missing
         assert!(parse_long_header(&p).is_none());
+    }
+
+    #[test]
+    fn the_gate_matches_the_parser_for_every_first_byte() {
+        // Behavioural model of the WinDivert gate, checked against the parser for
+        // all 256 possible first bytes rather than by searching source strings.
+        for value in 0u16..=255 {
+            let first = value as u8;
+            assert_eq!(
+                is_long_header_candidate(first),
+                first & 0x80 != 0,
+                "gate disagrees with the header-form bit for {first:#04x}"
+            );
+            let payload = long_header(first, VERSION_1);
+            assert_eq!(
+                parse_long_header(&payload).is_some(),
+                is_long_header_candidate(first),
+                "gate and parser disagree for {first:#04x}"
+            );
+        }
+        // Short headers (header form 0) are never captured.
+        for first in 0x00u8..=0x7f {
+            assert!(!is_long_header_candidate(first), "{first:#04x}");
+        }
+    }
+
+    #[test]
+    fn greased_fixed_bit_initials_reach_the_filter_and_the_parser() {
+        // 0x80..=0xBF = long header, fixed bit zero (RFC 9287 greasing). These are
+        // exactly the datagrams a `>= 0xC0` filter used to miss, so every one of
+        // them must be a gate hit and a parseable long header.
+        for first in 0x80u8..=0xBF {
+            assert!(is_long_header_candidate(first), "{first:#04x}");
+            assert!(
+                parse_long_header(&long_header(first, VERSION_1)).is_some(),
+                "greased long header {first:#04x} must reach the parser"
+            );
+        }
+        // Greased Initials specifically: v1 type bits 0 (0x80..=0x8F), v2 type
+        // bits 1 (0x90..=0x9F). Both count as a connection attempt.
+        for first in [0x80u8, 0x85, 0x8F] {
+            let payload = long_header(first, VERSION_1);
+            assert_eq!(
+                parse_long_header(&payload).map(|h| h.kind),
+                Some(QuicPacketKind::Initial)
+            );
+            assert!(is_connection_attempt(&payload), "{first:#04x}");
+        }
+        for first in [0x90u8, 0x95, 0x9F] {
+            let payload = long_header(first, VERSION_2);
+            assert_eq!(
+                parse_long_header(&payload).map(|h| h.kind),
+                Some(QuicPacketKind::Initial)
+            );
+            assert!(is_connection_attempt(&payload), "{first:#04x}");
+        }
     }
 }

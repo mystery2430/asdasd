@@ -113,6 +113,14 @@ Makinedeki diğer her şeye dokunulmaz. IP olmayan ve TCP olmayan paketler
 doğrudan geçer. Paket başına döngü `catch_unwind` içinde çalışır; bozuk tek
 bir paket süreci öldürmek yerine tek satırlık bir günlüğe düşer.
 
+Bir dönüşüm panik yaparsa yarım gönderim listesi atılır ve yakalanan paket
+**değiştirilmeden** iletilir: motor yakalama tamponunu hiç değiştirmez (tampon
+paylaşılan referansla geçirilir), yani geri yüklenecek bir şey yoktur. Ardından
+yakalama durur, çünkü `process` strateji kurulmadan önce bağlantı takibini,
+discovery'yi ve akışın denemesini günceller; bir unwind sonrasında bu durum
+yarım kalmış bir denemeyi anlatıyor olabilir. Ona dayanarak karar vermeye devam
+etmek durmaktan daha kötüdür ve çağıran taraf paniği hata olarak bildirir.
+
 ### Bağlantı takibi ve kararlar
 
 Yakalanan her paket, bağlantı bazında bir durum makinesini günceller. Sonuç
@@ -228,7 +236,7 @@ Bunun kime uygulandığı ise işin bütün özüdür:
 | `--quic` | Ne olur |
 |---|---|
 | `blocked` *(varsayılan)* | Yalnızca bir sansürcünün gerçekten bağlantı sıfırladığı yakalanan hedefler HTTP/3'ü kaybeder. Diğer her şey onu korur. |
-| `all` | Makinedeki her HTTP/3 bağlantısı reddedilir — GoodbyeDPI'ın yaklaşımı. Öğrenme gerektirmez; QUIC'i her yerde kaybettirir. |
+| `all` | Makinedeki her HTTP/3 bağlantı denemesi reddedilir — GoodbyeDPI'ın yaklaşımı, ancak yalnızca v1'e sabitlenen sürüm koşulu olmadan. QUIC v1, v2 ve bilinmeyen/taslak sürümler kapsanır; sıradan UDP ve kurulmuş bağlantıların kısa başlıklı paketleri eşleşmez. Öğrenme gerektirmez; QUIC'i her yerde kaybettirir. |
 | `off` | QUIC'e hiç dokunulmaz. Engelli bir site HTTP/3 üzerinden açılmamaya devam edebilir. |
 
 Varsayılanda bir hedef yalnızca TCP tarafında görülen **gerçek bir sıfırlama**
@@ -339,10 +347,14 @@ Derlemenizin gönderdiği tam gridi yazdırmak için
   bir sürücüyü boot'ta sessizce engelleyebilir. `service install`, hizmeti
   kaydetmeden önce sürücünün yüklendiğini kontrol eder ve yükleyemezse
   reddeder (ya da `--force` ile uyarır).
-- **Sabit bir kurulum yolu.** WinDivert, sürücüsünü `bosphorus.exe`'nin
-  bulunduğu yerden kaydeder; yürütülebilir dosyayı sonradan taşımak hizmeti
-  ve sürücüyü bozar. Kalıcı bir yerde tutun, ya da
-  `service install --install-dir` kullanın.
+- **Yönetici denetimindeki kurulum yolu.** `service install`, `bosphorus.exe`,
+  `WinDivert.dll` ve `WinDivert64.sys` dosyalarını varsayılan olarak
+  `%ProgramFiles%\Bosphorus` altına kopyalar; LocalSystem hizmeti artık
+  İndirilenler gibi kullanıcı tarafından yazılabilen bir klasörden çalışmaz.
+  `--install-dir` başka bir konum seçer, ancak gerçek DACL denetlenir ve
+  Everyone, INTERACTIVE, Authenticated Users veya yerleşik Users grubu
+  yazma/silme yetkisine sahipse kurulum reddedilir. Üç dosyanın da var olması
+  ve başarıyla kopyalanması servis oluşturulmadan önce doğrulanır.
 - Kaynaktan derlemek için `x86_64-pc-windows-msvc` hedefli **Rust** (kararlı,
   1.80 veya üzeri).
 
@@ -521,15 +533,20 @@ bosphorus service uninstall [--purge]   # --purge kaydedilmiş veriyi de siler
 bosphorus service run                   # yalnızca SCM giriş noktası, etkileşimli kullanım için değil
 ```
 
-- `--install-dir`, yürütülebilir dosyayı ve WinDivert dosyalarını sabit bir
-  klasöre kopyalar ve hizmeti o kopyadan kaydeder.
+- `--install-dir` verilmezse yürütülebilir dosya ve iki WinDivert dosyası
+  `%ProgramFiles%\Bosphorus` altına kopyalanır ve hizmet o kopyadan kaydedilir.
+  Verilirse gerçek erişim izinleri denetlenir; sıradan kullanıcıların
+  yazabildiği bir klasör servis oluşturulmadan reddedilir. Eksik veya boş bir
+  DLL/SYS artık uyarı değil, açık bir hatadır.
 - Kurulum programı, hizmetin ve sürücünün gerçekten geldiğini doğrulayan
   kısa bir PowerShell komut bloğu yazdırır — bir kez çalıştırmaya değer,
   çünkü boot zamanı bir sürücü engeli aksi hâlde sessizdir.
 - Hizmet, `--strategy`'siz `--engine` ile aynı otomatik keşif motorunu, kendi
   ağ bazlı profil deposu ve günlük klasörüyle çalıştırır. Yaşam döngüsü
   olayları ayrıca Windows Application olay günlüğüne `Bosphorus` sağlayıcı
-  adıyla yazılır.
+  adıyla yazılır. Rota/adres bildirimleri kaydedilemezse hata oraya yazılır
+  ve hizmet 30 saniyelik NetKey yoklamasına düşer; normal bildirim yolunda
+  yoklama yapılmaz.
 
 ## Dosyalar, klasörler ve günlükler
 
@@ -590,8 +607,10 @@ Get-ChildItem "$env:ProgramData\Bosphorus\profiles\*.json" | Select Name, LastWr
   vardır — ama QUIC'in kendisi için bir atlatma stratejisi yoktur, çünkü QUIC
   el sıkışmasındaki isim şifrelidir ve bölünecek ya da gölgelenecek bir şey
   kalmaz.
-- **DNS** yönlendirmesi henüz uygulanmadı; DNS bazlı engelleme yalnızca
-  gözlemlenebilir, düzeltilmez.
+- **DNS** yönlendirmesi uygulanmadı. `dns_upstream` yapılandırması artık açık
+  bir yapılandırma hatasıyla reddedilir; yalnızca UDP/53 filtresi eklemek DNS
+  yönlendirmesi değildir. DNS bazlı engelleme yalnızca gözlemlenebilir,
+  düzeltilmez.
 - **IP katmanı parçalama** değerlendirildi ve bilinçli olarak rafa
   kaldırıldı (fazla karadelik riski, Windows'ta doğrulanmadı).
 - **Domain fronting** kapsam dışıdır — yalnızca paket manipülasyonunun tek

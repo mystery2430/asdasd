@@ -112,6 +112,14 @@ Everything else on the machine is untouched. Non-IP and non-TCP packets pass
 straight through. The per-packet loop runs inside `catch_unwind`, so a single
 malformed packet degrades to one log line rather than killing the process.
 
+If a transform panics, the partial send batch is discarded and the captured
+packet is forwarded **unchanged** — the engine never mutates the captured buffer
+(it is passed by shared reference), so there is nothing to restore. Capture then
+stops: `process` updates connection tracking, discovery and the flow's trial
+before it builds a strategy, so after an unwind that state may describe a
+half-finished trial. Continuing to make decisions from it would be worse than
+stopping, and the caller reports the panic as an error.
+
 ### Connection tracking & verdicts
 
 Every captured packet updates a per-connection state machine. Once the
@@ -225,7 +233,7 @@ Who that applies to is the whole point:
 | `--quic` | What happens |
 |---|---|
 | `blocked` *(default)* | Only destinations where a censor was actually caught resetting a connection lose HTTP/3. Everything else keeps it. |
-| `all` | Every HTTP/3 connection on the machine is refused — GoodbyeDPI's approach. No learning needed; costs QUIC everywhere. |
+| `all` | Every HTTP/3 connection attempt on the machine is refused — GoodbyeDPI's approach, without its v1-only version pin. QUIC v1, v2 and unknown/draft versions are covered. The datagram is parsed before anything is dropped, so short-header (established) QUIC and UDP payloads that merely *look* like a long header are forwarded. No learning needed; costs QUIC everywhere. |
 | `off` | QUIC is never touched. A blocked site may keep failing over HTTP/3. |
 
 Under the default, a destination is marked only by a **real reset** (`DpiReset`
@@ -240,6 +248,17 @@ The unit here is an address, not a hostname, because a QUIC handshake carries
 no readable name. A blocked host sharing a CDN address with allowed ones
 therefore costs those hosts HTTP/3 too — they fall back to TCP and keep
 working, just without QUIC's speed advantage.
+
+What the classification cannot do is prove a datagram is QUIC. Nothing is
+decrypted and no connection is reassembled, so the checks are structural: a
+long header (RFC 9000 §17.2) with a valid connection-ID length, whose packet
+type says *Initial* for a known version (or any type for a version this build
+does not know, since a draft or future Initial opens a connection exactly like
+v1 does). A hand-crafted non-QUIC datagram that happens to parse that way, is
+at least 1200 bytes, and starts with a byte ≥ `0x80` is indistinguishable here
+and is refused under `all`. Random payloads almost never pass, because the
+connection-ID length byte alone rejects most of them, but this is a heuristic
+with a documented false-positive class rather than proof.
 
 ### Live network switching
 
@@ -334,10 +353,14 @@ A Cargo workspace of three crates:
   driver silently at boot. `service install` checks the driver loads before
   registering the service, and refuses (or warns, with `--force`) if it
   can't.
-- **A stable install path.** WinDivert registers its driver from wherever
-  `bosphorus.exe` lives; moving the executable later breaks the service and
-  the driver with it. Keep it somewhere permanent, or use
-  `service install --install-dir`.
+- **An administrator-controlled install path.** `service install` now always
+  copies `bosphorus.exe`, `WinDivert.dll` and `WinDivert64.sys` into
+  `%ProgramFiles%\Bosphorus` by default, so a LocalSystem service never loads
+  from Downloads or another user-writable folder. `--install-dir` overrides
+  the location, but the installer inspects that directory's real DACL and
+  refuses it when Everyone, INTERACTIVE, Authenticated Users or the built-in
+  Users group has write/delete rights. All three files must exist and be
+  copied successfully before the service is created.
 - **Rust (stable, 1.80 or newer)** targeting `x86_64-pc-windows-msvc`, to
   build from source.
 
@@ -508,15 +531,20 @@ bosphorus service uninstall [--purge]   # --purge also deletes saved data
 bosphorus service run                   # SCM entry point only, not for interactive use
 ```
 
-- `--install-dir` copies the executable and the WinDivert files into a
-  stable folder and registers the service from that copy.
+- Without `--install-dir`, the executable and both WinDivert files are copied
+  to `%ProgramFiles%\Bosphorus` and the service is registered from that copy.
+  `--install-dir` selects another administrator-controlled folder; a directory
+  writable by ordinary users is rejected before the service is created. A
+  missing or empty DLL/SYS is an error, not a warning.
 - The installer prints a short block of PowerShell commands that confirm the
   service and driver actually came up — worth running once, since a
   boot-time driver block is otherwise silent.
 - The service runs the same auto-discovery engine as `--engine` with no
   `--strategy`, with its own per-network profile store and log folder.
   Lifecycle events are also written to the Windows Application event log
-  under the provider name `Bosphorus`.
+  under the provider name `Bosphorus`. If route/address notifications cannot
+  be registered, the failure is logged there and the service falls back to a
+  30-second NetKey poll; the normal notification path does no polling.
 
 ## Files, folders & logs
 
@@ -575,8 +603,9 @@ Get-ChildItem "$env:ProgramData\Bosphorus\profiles\*.json" | Select Name, LastWr
   back onto TCP (see [the QUIC policy](#quic-and-http3)), where it does have a
   strategy — but it has no evasion strategies for QUIC itself, because the name
   inside a QUIC handshake is encrypted and there is nothing to split or shadow.
-- **DNS** redirection isn't implemented yet; DNS-based blocking is only
-  observable, not corrected.
+- **DNS** redirection isn't implemented. A non-`None` `dns_upstream` is now
+  rejected with an explicit configuration error: adding a UDP/53 capture clause
+  is not redirection. DNS-based blocking is only observable, not corrected.
 - **IP-layer fragmentation** was evaluated and deliberately shelved (too
   much blackhole risk, unverified on Windows).
 - **Domain fronting** is out of scope — it needs cooperation from the client

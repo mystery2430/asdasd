@@ -80,10 +80,10 @@ pub fn run(n: usize) -> anyhow::Result<()> {
 }
 
 fn drive(engine: &Engine, pkt: Vec<u8>, outbound: bool) -> Decision {
-    let mut p = pkt;
-    let mut meta = CaptureMeta { outbound, ..Default::default() };
+    let p = pkt;
+    let meta = CaptureMeta { outbound, ..Default::default() };
     let mut out = SendBatch::new();
-    engine.process(&mut p, &mut meta, &mut out)
+    engine.process(&p, &meta, &mut out)
 }
 
 fn target_phase(engine: &Engine, host: &str) -> Option<NetPhase> {

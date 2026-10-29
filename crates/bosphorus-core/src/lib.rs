@@ -18,6 +18,7 @@ pub mod error;
 pub mod filter;
 pub mod packet;
 pub mod profile;
+pub mod service_acl;
 mod source_sink;
 pub mod strategy;
 

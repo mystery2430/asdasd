@@ -1,12 +1,14 @@
-//! WinDivert filter fragments copied **verbatim** from
-//! `ValdikSS/GoodbyeDPI` `src/goodbyedpi.c` (`master`):
-//!   * lines 33-61   — `DIVERT_NO_LOCALNETSv4/v6_{SRC,DST}`
-//!   * lines 82-84   — `FILTER_PASSIVE_BLOCK_QUIC`
-//!   * lines 203-204 — `add_filter_str` UDP form (DNS clause)
-//!   * lines 242-245 — `maxpayloadsize_str`
+//! WinDivert filter fragments derived from `ValdikSS/GoodbyeDPI`
+//! `src/goodbyedpi.c` (`master`):
+//!   * lines 33-61   — `DIVERT_NO_LOCALNETSv4/v6_{SRC,DST}` (verbatim)
+//!   * lines 242-245 — `maxpayloadsize_str` (verbatim)
+//!   * lines 82-84   — `FILTER_PASSIVE_BLOCK_QUIC` (deliberate, documented
+//!     changes; see [`QUIC_CAPTURE_FMT`])
 //!
-//! Do not paraphrase or "tidy" these — they must match GoodbyeDPI byte for byte
-//! (C adjacent-string-literal concatenation already applied).
+//! Do not paraphrase or "tidy" the verbatim constants — they must match
+//! GoodbyeDPI byte for byte (C adjacent-string-literal concatenation already
+//! applied). The QUIC fragment is ours: it captures instead of dropping, because
+//! a filter cannot tell QUIC from an ordinary large UDP datagram.
 
 pub const NO_LOCALNETS_V4_DST: &str = "((ip.DstAddr < 127.0.0.1 or ip.DstAddr > 127.255.255.255) and (ip.DstAddr < 10.0.0.0 or ip.DstAddr > 10.255.255.255) and (ip.DstAddr < 192.168.0.0 or ip.DstAddr > 192.168.255.255) and (ip.DstAddr < 172.16.0.0 or ip.DstAddr > 172.31.255.255) and (ip.DstAddr < 169.254.0.0 or ip.DstAddr > 169.254.255.255))";
 
@@ -16,32 +18,34 @@ pub const NO_LOCALNETS_V6_DST: &str = "((ipv6.DstAddr > ::1) and (ipv6.DstAddr <
 
 pub const NO_LOCALNETS_V6_SRC: &str = "((ipv6.SrcAddr > ::1) and (ipv6.SrcAddr < 2001::0 or ipv6.SrcAddr > 2001:1::0) and (ipv6.SrcAddr < fc00::0 or ipv6.SrcAddr > fe00::0) and (ipv6.SrcAddr < fe80::0 or ipv6.SrcAddr > fec0::0) and (ipv6.SrcAddr < ff00::0 or ipv6.SrcAddr > ffff::0))";
 
-/// `FILTER_PASSIVE_BLOCK_QUIC` (goodbyedpi.c:82-84) — verbatim. Used only for
-/// [`QuicPolicy::All`](crate::config::QuicPolicy::All), where the handle drops
-/// every match in the driver and the engine never sees the packets.
-pub const QUIC_DROP: &str = "outbound and !impostor and !loopback and udp and udp.DstPort == 443 and udp.PayloadLength >= 1200 and udp.Payload[0] >= 0xC0 and udp.Payload32[1b] == 0x01";
-
-/// Ours, not GoodbyeDPI's: the capture clause for
-/// [`QuicPolicy::Blocked`](crate::config::QuicPolicy::Blocked), where the drop
-/// decision is per destination and therefore has to be made in the engine.
+/// Capture clause for both QUIC blocking policies
+/// ([`QuicPolicy::Blocked`](crate::config::QuicPolicy::Blocked) and
+/// [`QuicPolicy::All`](crate::config::QuicPolicy::All)).
 ///
-/// It deliberately drops GoodbyeDPI's `udp.Payload32[1b] == 0x01` version pin —
-/// that clause only matches QUIC v1, and both v2 (RFC 9369) and the draft
-/// versions still in the wild open connections exactly the same way.
-/// [`crate::packet::quic`] does the precise classification once a datagram is
-/// in hand; this clause only has to be cheap and not miss anything.
+/// This is *not* a drop rule. WinDivert's filter language can only inspect the
+/// first payload bytes and the datagram length, so it cannot prove that a
+/// datagram is QUIC: an ordinary UDP/443 datagram of 1200 bytes whose first byte
+/// is `0x80..=0xFF` satisfies the same test. GoodbyeDPI's
+/// `FILTER_PASSIVE_BLOCK_QUIC` (goodbyedpi.c:82-84) accepts that ambiguity and
+/// drops the packet; this project instead hands candidates to
+/// [`crate::packet::quic`], which parses the long header and drops only real
+/// connection attempts. Everything else is forwarded untouched.
 ///
-/// `PayloadLength >= 1200` is what makes that safe: a client must pad any
-/// datagram containing an Initial to at least 1200 bytes, so nothing that opens
-/// a connection can slip past, while the short packets of an established
-/// connection never reach the engine.
-pub const QUIC_SELECTIVE_FMT: &str = "(outbound and !impostor and !loopback and udp and {dst_ports} and udp.PayloadLength >= 1200 and udp.Payload[0] >= 0xC0 and ({v4dst} or {v6dst}))";
+/// Deliberate differences from GoodbyeDPI:
+///
+/// * no `udp.Payload32[1b] == 0x01` version pin — that only matches QUIC v1 and
+///   would let v2 (RFC 9369) and draft versions open connections untouched;
+/// * `{min_first_byte}` is `0x80` (the long-header form bit), not `0xC0`, because
+///   RFC 9287 lets endpoints grease the fixed bit to zero — see
+///   [`LONG_HEADER_FIRST_BYTE_MIN`](crate::packet::quic::LONG_HEADER_FIRST_BYTE_MIN);
+/// * `{dst_ports}` is the configured TLS/QUIC port set, so a custom
+///   `tls_ports`/QUIC port is not silently ignored;
+/// * `udp.PayloadLength >= 1200` — a datagram carrying an Initial must be padded
+///   to 1200 bytes, so the short packets of an established connection never
+///   reach the engine.
+pub const QUIC_CAPTURE_FMT: &str = "(outbound and !impostor and !loopback and udp and {dst_ports} and udp.PayloadLength >= 1200 and udp.Payload[0] >= {min_first_byte} and ({v4dst} or {v6dst}))";
 
 /// `maxpayloadsize_str` (goodbyedpi.c:242-245) — verbatim, with GoodbyeDPI's
 /// `%hu` replaced by the `{n}` placeholder. "GET " = 0x47455420,
 /// "POST" = 0x504F5354 (big endian).
 pub const MAXPAYLOAD_FMT: &str = "and (tcp.PayloadLength ? tcp.PayloadLength < {n} or tcp.Payload32[0] == 0x47455420 or tcp.Payload32[0] == 0x504F5354 or (tcp.Payload[0] == 0x16 and tcp.Payload[1] == 0x03 and tcp.Payload[2] <= 0x03): true)";
-
-/// `add_filter_str` UDP form (goodbyedpi.c:203-204) with port 53 substituted
-/// for `%d`, and the leading `" or "` dropped (the builder adds it).
-pub const DNS_CLAUSE_PORT53: &str = "(udp and !impostor and !loopback and (udp.SrcPort == 53 or udp.DstPort == 53))";

@@ -20,6 +20,9 @@ pub const ID_GRID_EXHAUSTED: u32 = 1004;
 pub const ID_PANIC: u32 = 1005;
 /// A stored service argument could not be read; the default was used instead.
 pub const ID_BAD_ARGUMENT: u32 = 1006;
+/// Route/address notifications could not be registered; the service is now
+/// polling the NetKey as a fallback.
+pub const ID_NETWATCH_FAILED: u32 = 1007;
 
 pub const SOURCE_NAME: &str = "Bosphorus";
 
